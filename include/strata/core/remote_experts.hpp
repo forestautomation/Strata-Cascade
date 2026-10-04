@@ -36,6 +36,12 @@ public:
                int64_t k, const int32_t* kind, const int32_t* primary_res,
                std::string& err);
     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
+    /// Whether this helper currently holds `(layer, expert)` in its device cache.  Used by the adaptive tier so a
+    /// pair this GPU already computes is never pulled into the primary cache as well (which would duplicate GPU
+    /// work and evict a genuine miss).
+    bool holds(int64_t layer, int64_t expert) const {
+        return cache_.valid() && cache_.slot_of(layer, expert) >= 0;
+    }
     bool finish(float* out, std::string& err);
     int64_t resident() const { return cache_.resident(); }
     int64_t computed() const { return computed_; }

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -36,6 +37,10 @@
 #include <utility>
 #include <string>
 #include <vector>
+#include <thread>
+#include <deque>
+#include <condition_variable>
+#include <mutex>
 
 namespace strata::kernels::cpu {
 struct ExpertLayout;
@@ -143,6 +148,13 @@ public:
     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
     /// Whether `warm` does anything (the predictor is not run otherwise).
     virtual bool warms() const { return false; }
+
+    /// Copy a blob (a pointer `blob()` returned) into `dst`.  The tiered source reads an unpinned one from the file
+    /// with one unbuffered read; everything else is a memcpy.
+    virtual void read_into(const uint8_t* src, uint8_t* dst, size_t n) const { std::memcpy(dst, src, n); }
+    /// True when an unpinned blob costs an SSD read: the prompt path then keeps more of those reads in flight and
+    /// reads them with `read_into`.  False for every RAM-resident source.
+    virtual bool streams_from_ssd() const { return false; }
 };
 
 /// CS-T, routing-aware prefetch of the file tier: when the CPU pool starts layer `l`, a worker thread applies layer
@@ -678,5 +690,122 @@ bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::E
 /// `unbuffered`: each chunk read past the file cache (Windows).
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered = false);
+
+// ---- THE TIERED SOURCE: the experts for a machine whose RAM does not hold all of them.
+//
+// `ArenaExpertSource` copies every expert into RAM, including the ones the VRAM cache already holds and that no
+// path reads from the host again once the cache is filled (the cache never evicts; prefill skips resident
+// experts; the verify window computes them from VRAM).  On 32 GB that copy is the difference between fitting
+// and not.  This source maps `experts.bin` and, once the cache is filled, sorts every expert into one of three
+// tiers:
+//
+//   VRAM   - resident in the cache.  Its file pages are dropped from the page cache and never touched again.
+//            A pair resident in a *different* VRAM tier (a layer-split stage, a CUDA1..3 helper) is VRAM too:
+//            `settle` is told about those with `also_vram`, so it is neither pinned nor prefetched.
+//   PINNED - the next experts by profile rank, up to the host budget.  Faulted in and page-locked with
+//            `cudaHostRegister`, so they neither get evicted (the variance that made `--mmap-experts` lose) nor
+//            lose the DMA paths (prefill's direct copy, the PCIe share of the misses).
+//   COLD   - the rest: ordinary mapped pages the kernel pages in from the SSD and reclaims under pressure.
+//            `begin_layer` asks for a routed cold expert's whole blob in one read before the pool faults on it.
+//
+// The pointer arithmetic is the layout's (`blob_offset`), so the kernels see exactly the bytes they did.
+class TieredExpertSource : public ExpertSource {
+public:
+    TieredExpertSource() = default;
+    ~TieredExpertSource() override;
+    TieredExpertSource(const TieredExpertSource&) = delete;
+    TieredExpertSource& operator=(const TieredExpertSource&) = delete;
+
+    bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+    /// A native (IQ) pack has no experts.bin: with shard 1 set, `open` writes one from it the first time.
+    void set_gguf(const std::string& shard1) { gguf_ = shard1; }
+    /// The live residency table (`host_res`, slot or < 0 per pair).  With it `begin_layer` also prefetches an expert
+    /// the adaptive swap has evicted from VRAM - its RAM copy was dropped when it went resident.
+    void set_residency(const int32_t* host_res) { res_ = host_res; }
+    /// After the cache fill.  `budget_bytes` < 0 means auto: what `MemAvailable` leaves above `reserve_bytes`.
+    ///
+    /// `also_vram` (nullable) is a per-pair mask, `n_layers * n_expert` bytes, of experts resident in ANOTHER VRAM
+    /// tier: a layer-split stage's cache or a CUDA1..3 helper.  Those are marked `kVram` too and are never pinned
+    /// and never prefetched - a locked RAM copy of a blob another GPU already holds is the one tier the design is
+    /// supposed to avoid, and `settle` can only see the primary cache on its own.  Callers that fill a helper must
+    /// therefore settle AFTER it, with the helper's claim set.
+    bool settle(const ExpertCache* cache, const uint8_t* also_vram,
+                const std::vector<std::pair<int32_t, int32_t>>& profile,
+                int64_t budget_bytes, int64_t reserve_bytes, int threads, std::string& err);
+    /// The adaptive swap moved `(layer, expert)` into the primary VRAM cache.  If it was PINNED, its RAM copy is
+    /// KEPT as the pair's cheap re-read home (the bytes stay locked either way; `retained_pins()` counts them), so
+    /// a later eviction costs a memcpy, not an SSD read.  The slot stays authoritative while host_res marks it.
+    void promote_to_vram(int64_t layer, int64_t expert);
+    /// Pinned pairs whose copy was kept when an adaptive swap promoted them into VRAM (their RAM home).
+    int64_t retained_pins() const { return retained_pins_; }
+    void close();
+
+    const uint8_t* blob(int64_t layer, int64_t expert) override;
+    int64_t reads() const override { return reads_; }
+    bool pinned(int64_t layer, int64_t expert) const override;
+    const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    /// Whether the verify window may give the GPU a PCIe share of this layer's misses: true while any PINNED blob
+    /// exists (the window still checks each expert with `pinned()`).
+    bool pcie_layer(int64_t layer) const override { (void) layer; return !regs_.empty(); }
+    void read_into(const uint8_t* src, uint8_t* dst, size_t n) const override;
+    bool streams_from_ssd() const override { return true; }
+
+    const std::string& note() const { return note_; }
+    int64_t cold_prefetches() const { return cold_prefetches_; }
+    /// Decode-time CPU misses by tier: how many `blob()` calls the pool had to serve itself.  A `pinned` one comes
+    /// from the locked RAM tier; a `cold` one faults the mapped file (the SSD).  `cold_prefetched` of the cold ones
+    /// had their whole blob asked for by `begin_layer` before the pool touched them.
+    int64_t pinned_reads() const { return pinned_reads_; }
+    int64_t cold_reads() const { return cold_reads_; }
+    int64_t cold_read_bytes() const { return cold_read_bytes_; }
+    int64_t cold_prefetched_reads() const { return cold_pf_reads_; }
+
+    enum Tier : uint8_t { kVram = 0, kPinned = 1, kCold = 2 };
+
+private:
+    const uint8_t* base_ = nullptr;
+    uint64_t map_bytes_ = 0;       ///< the reservation: the file plus one largest blob of anonymous tail
+    uint64_t file_bytes_ = 0;
+#if defined(_WIN32)
+    // Windows has no MAP_FIXED in-place anonymous remap, so the PINNED tier lives in its OWN anonymous region
+    // (`pin_base_`) rather than replacing pages of the file mapping.  `blob()` dispatches on the tier.
+    void* file_ = nullptr;         ///< HANDLE: the mapping's file
+    void* map_ = nullptr;          ///< HANDLE: the file mapping object
+    void* view_ = nullptr;         ///< the mapped view's base (== base_)
+    void* dfile_ = nullptr;        ///< HANDLE: FILE_FLAG_NO_BUFFERING|OVERLAPPED for cold reads (or null)
+    uint8_t* tail_ = nullptr;      ///< the committed anonymous tail past the file (blob overhang reads as zero)
+    uint64_t tail_bytes_ = 0;
+    uint8_t* pin_base_ = nullptr;  ///< the PINNED tier's anonymous region
+    uint64_t pin_bytes_ = 0;
+    std::vector<int64_t> pin_off_; ///< per (layer, expert): offset into `pin_base_`, or -1
+#else
+    int fd_ = -1;
+    int dfd_ = -1;                 ///< O_DIRECT descriptor for streamed reads (read_into)
+#endif
+    // cold-expert prefetch off the pool's thread (begin_layer queues, these threads madvise)
+    std::mutex pf_mu_;
+    std::condition_variable pf_cv_;
+    std::deque<std::pair<uint64_t, uint64_t>> pf_q_;
+    std::vector<std::thread> pf_threads_;
+    bool pf_stop_ = false;
+    int64_t n_layers_ = 0;
+    int64_t n_expert_ = 0;
+    int64_t reads_ = 0;
+    int64_t cold_prefetches_ = 0;
+    int64_t pinned_reads_ = 0;                           ///< blob() served from the PINNED RAM tier
+    int64_t cold_reads_ = 0;                             ///< blob() served from the mapped COLD (SSD) tier
+    int64_t cold_read_bytes_ = 0;                        ///< bytes the cold_reads_ named
+    int64_t cold_pf_reads_ = 0;                          ///< of cold_reads_, those begin_layer prefetched
+    std::vector<int64_t> pf_seen_;                       ///< per (layer, expert): the begin_layer epoch that prefetched it
+    int64_t pf_epoch_ = 0;                               ///< bumped once per begin_layer
+    std::vector<uint8_t> tier_;                          ///< per (layer, expert)
+    std::vector<uint8_t> other_vram_;                    ///< per (layer, expert): a stage or CUDA1..3 holds it
+    std::vector<std::pair<uint8_t*, uint64_t>> regs_;    ///< the page-locked runs
+    int64_t retained_pins_ = 0;                                ///< PINNED blobs the adaptive swap promoted into VRAM
+    std::string note_;
+    std::string gguf_;
+    const int32_t* res_ = nullptr;
+};
 
 }  // namespace strata::core

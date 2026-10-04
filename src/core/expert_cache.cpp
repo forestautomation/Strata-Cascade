@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <utility>
 #include <cstring>
+#include <mutex>
 
 namespace strata::core {
 
@@ -336,6 +337,36 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
+namespace {
+// **A BLOB THAT STRADDLES A REGISTRATION EDGE.**  The tiered source page-locks runs of experts widened to whole
+// pages, so the first or last page of a NEIGHBOURING, unlocked expert can lie inside a registered range while the
+// rest of it does not.  CUDA takes a source pointer inside a registration as pinned and refuses a copy that runs
+// past its end ("invalid argument").  Such a copy goes through a pinned bounce buffer instead: a plain memcpy
+// reads any page, and the DMA then starts from memory that is pinned end to end.
+bool bounce_copy(uint8_t* dst, const uint8_t* src, size_t n, cudaStream_t stream) {
+    static std::mutex mu;   // the refill paths run on different threads; one bounce buffer serves them all
+    static uint8_t* buf = nullptr;
+    static size_t cap = 0;
+    std::lock_guard<std::mutex> lk(mu);
+    if (cap < n) {
+        if (buf != nullptr) cudaFreeHost(buf);
+        buf = nullptr;
+        cap = 0;
+        if (cudaHostAlloc((void**) &buf, n, cudaHostAllocDefault) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        cap = n;
+    }
+    // the previous bounce on this stream must have left the buffer before it is overwritten
+    if (stream != nullptr) cudaStreamSynchronize(stream); else cudaDeviceSynchronize();
+    std::memcpy(buf, src, n);
+    const cudaError_t e = stream != nullptr ? cudaMemcpyAsync(dst, buf, n, cudaMemcpyHostToDevice, stream)
+                                            : cudaMemcpy(dst, buf, n, cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) return false;
+    // synchronous either way: the buffer is reused by the next call
+    if (stream != nullptr) cudaStreamSynchronize(stream);
+    return true;
+}
+}  // namespace
+
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
@@ -348,8 +379,11 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
-                                          (cudaStream_t) stream);
+    cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+    if (e == cudaErrorInvalidValue) {
+        (void) cudaGetLastError();
+        e = bounce_copy(dst, host_blob, n, (cudaStream_t) stream) ? cudaSuccess : cudaErrorInvalidValue;
+    }
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
         return false;
@@ -379,7 +413,13 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     std::memcpy(blocking_staging_, host_blob, n);
     const cudaError_t e = cudaMemcpy(dst, blocking_staging_, n, cudaMemcpyHostToDevice);
 #else
-    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+    // A tiered-source blob may straddle a page-locked registration edge, which CUDA reads as "invalid
+    // argument": bounce it through pinned memory instead (see bounce_copy).
+    cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+    if (e == cudaErrorInvalidValue) {
+        (void) cudaGetLastError();
+        e = bounce_copy(dst, host_blob, n, nullptr) ? cudaSuccess : cudaErrorInvalidValue;
+    }
 #endif
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
@@ -397,7 +437,13 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    if (e == cudaErrorInvalidValue || e == cudaErrorMemoryAllocation) {
+        // A host blob that straddles a pinned-registration edge, or a page-lock allocation that failed: bounce it
+        // through pinned/pageable memory instead (see bounce_copy).
+        (void) cudaGetLastError();
+        e = bounce_copy(dst, host_blob, n, (cudaStream_t) 0) ? cudaSuccess : cudaErrorInvalidValue;
+    }
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
         return false;

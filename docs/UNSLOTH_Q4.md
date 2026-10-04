@@ -63,7 +63,7 @@ Hugging Face snapshot symlinks work if you pass the snapshot's file name, not th
 
 ## What it needs
 
-| | |
+| Requirement | Detail |
 | --- | --- |
 | Disk | 111.3 GB for the four files, 1.4 GB for the pack, ~6 GB for the MTP draft layer if you have none yet. **No `experts.bin`**: the engine reads the experts from the GGUF files in place. An NVMe SSD matters: the experts that fit neither VRAM nor the RAM budget are read from it for every token. |
 | RAM | 64 GB measured. The RAM budget (below) holds the most-used experts; the rest come from the SSD through the OS file cache. |
@@ -214,7 +214,7 @@ engine with `--short-read` covering the positions to compare; llama.cpp's side w
 
 ## Opt-ins and switches (environment variables)
 
-| | |
+| Variable | Effect |
 | --- | --- |
 | `STRATA_LOOKAHEAD=0` | Turns off the routing-aware prefetch (on by default in this mode): while the CPU works on a layer, a thread applies the next layer's router to this layer's input and asks the OS to read the predicted experts' pages. Pages only, the answers are the same. About half of the SSD reads were predicted; mean +14% (6.9 -> 7.9 tok/s). `STRATA_LOOKAHEAD_K` sets the experts per token (default 10). |
 | `STRATA_KQ256=1` | Multi-token AVX2 kernels for the Q4_K / Q5_1 / Q8_0 experts. Bit-exact with ggml's, but measured no faster, so off. |

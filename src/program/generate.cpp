@@ -21,6 +21,7 @@
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -266,6 +267,15 @@ struct Options {
     bool no_host_worker = false;
     bool coupled_draft = strata::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
+    /// VRAM / pinned RAM / SSD tiers (TieredExpertSource): for a machine whose RAM does not hold every expert.
+    bool tiered_experts = false;
+    double host_budget_gib = -1.0;   ///< the PINNED tier's size; < 0 = auto (MemAvailable - reserve)
+    double host_reserve_gib = 8.0;   ///< auto leaves this much RAM for the cold tier's page cache and the OS
+    /// Opt-in: watch for RAM/commit pressure and, while it lasts, pause cold prefetch and (Windows) trim this
+    /// process to the standby list and lower its memory priority so the OS reclaims its cheap (file-backed)
+    /// pages instead of paging other apps to a slow page file.  On Linux it samples MemAvailable and pauses
+    /// prefetch only (the kernel already reclaims the clean pages).  See `platform::MemoryGuardConfig`.
+    bool memory_guard = false;
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
@@ -553,6 +563,28 @@ void usage() {
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
                  "                       0 = on QUIT only) between requests; start from it with --expert-profile P\n"
+                 "  --tiered-experts     the VRAM / pinned RAM / SSD tiers, for a PC whose RAM does not hold\n"
+                 "                       every expert: maps experts.bin, page-locks the most-routed experts up\n"
+                 "                       to --host-budget-gib, and pages the rest in from the SSD one blob at a\n"
+                 "                       time.  Unlike --mmap-experts it needs no prebuilt experts.bin (it writes\n"
+                 "                       one from a native pack's shard 1 on first use).\n"
+                 "  --host-budget-gib N  the PINNED tier's size (default auto: free RAM minus --host-reserve-gib)\n"
+                 "  --host-reserve-gib N RAM left for the cold tier's page cache and the OS with an auto budget\n"
+                 "                       (default 8)\n"
+                 "  --memory-guard       opt-in: let RAM fill, then yield on demand.  Watches a free-RAM target\n"
+                 "                       and a fast-decline trend; on pressure pauses cold prefetch and (Windows)\n"
+                 "                       lowers this process's memory priority and trims its cheap file-backed\n"
+                 "                       pages (soft ceiling by default; hard = trim now).  On Linux the priority,\n"
+                 "                       ceiling and notifications are Windows-only, so it only pauses prefetch.\n"
+                 "                       Alias: --windows-memory-guard.\n"
+                 "                       Env: STRATA_MEMORY_GUARD (alias STRATA_WINDOWS_MEMORY_GUARD),\n"
+                 "                       STRATA_MEM_GUARD_KEEP_FREE_MIB (512), STRATA_MEM_GUARD_MIN_MIB (512),\n"
+                 "                       STRATA_MEM_GUARD_EMERGENCY_MIB (256), STRATA_MEM_GUARD_COMMIT_MIB (2048),\n"
+                 "                       STRATA_MEM_GUARD_POLL_MS (500), STRATA_MEM_GUARD_RETRIM_MS (3000),\n"
+                 "                       STRATA_MEM_GUARD_COOLDOWN_MS (2000), STRATA_MEM_GUARD_TRIM=soft|hard|0,\n"
+                 "                       STRATA_MEM_GUARD_NOTIFY=0, STRATA_MEM_GUARD_PREDICT=0,\n"
+                 "                       STRATA_MEM_GUARD_PREDICT_SLOPE (128 MiB/s), STRATA_MEM_GUARD_PRIORITY=0,\n"
+                 "                       STRATA_MEM_GUARD_VERBOSE=1, STRATA_MEM_GUARD_STATS=1.\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -1304,6 +1336,13 @@ int main(int argc, char** argv) {
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--tiered-experts") o.tiered_experts = true;
+        else if (a == "--host-budget-gib") {
+            const std::string v = next("--host-budget-gib");
+            o.host_budget_gib = (v == "auto") ? -1.0 : std::atof(v.c_str());
+        }
+        else if (a == "--host-reserve-gib") o.host_reserve_gib = std::atof(next("--host-reserve-gib"));
+        else if (a == "--windows-memory-guard" || a == "--memory-guard") o.memory_guard = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
@@ -1346,7 +1385,57 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::set_coupled_draft(o.coupled_draft);
+    strata::core::set_coupled_draft(o.coupled_draft);
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    // --memory-guard / --windows-memory-guard (or STRATA_MEMORY_GUARD / STRATA_WINDOWS_MEMORY_GUARD): start
+    // before the model loads, so the load's footprint spikes are covered too.
+    if (const char* v = std::getenv("STRATA_MEMORY_GUARD"); v != nullptr)
+        o.memory_guard = std::atoi(v) != 0;
+    else if (const char* v = std::getenv("STRATA_WINDOWS_MEMORY_GUARD"); v != nullptr)
+        o.memory_guard = std::atoi(v) != 0;
+    if (o.memory_guard) {
+        strata::platform::MemoryGuardConfig g;
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_MIN_MIB")) g.min_avail_mib = std::strtoull(v, nullptr, 10);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_KEEP_FREE_MIB")) g.keep_free_mib = std::strtoull(v, nullptr, 10);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_COMMIT_MIB")) g.min_commit_mib = std::strtoull(v, nullptr, 10);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_EMERGENCY_MIB")) g.emergency_mib = std::strtoull(v, nullptr, 10);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_POLL_MS")) g.poll_ms = std::atoi(v);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_RETRIM_MS")) g.retrim_ms = std::atoi(v);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_COOLDOWN_MS")) g.cooldown_ms = std::atoi(v);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_TRIM")) {
+            const std::string t(v);
+            if (t == "0" || t == "off" || t == "false") g.trim = strata::platform::MemGuardTrim::Off;
+            else if (t == "soft") g.trim = strata::platform::MemGuardTrim::Soft;
+            else g.trim = strata::platform::MemGuardTrim::Hard;   // "1"/"hard"/anything truthy (old behaviour)
+        }
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_PRIORITY")) g.priority = std::atoi(v) != 0;
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_NOTIFY")) g.notify = std::atoi(v) != 0;
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_PREDICT")) g.predictive = std::atoi(v) != 0;
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_PREDICT_SLOPE")) g.predict_slope_mib_s = std::atof(v);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_PREDICT_BAND_MIB")) g.predict_band_mib = std::strtoull(v, nullptr, 10);
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_VERBOSE")) g.verbose = std::atoi(v) != 0;
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_STATS")) g.stats = std::atoi(v) != 0;
+        const char* trim_name = g.trim == strata::platform::MemGuardTrim::Off   ? "off"
+                                : g.trim == strata::platform::MemGuardTrim::Soft ? "soft"
+                                                                                 : "hard";
+        std::string guard_why;
+        if (strata::platform::memory_guard_start(g, guard_why)) {
+#if defined(_WIN32)
+            const char* backend = "windows";
+#else
+            const char* backend = "linux (MemAvailable; trim/priority/notify are Windows-only)";
+#endif
+            std::fprintf(stderr,
+                         "strata generate: memory guard on (%s): keep %llu MiB free (floor %llu MiB, emergency %llu MiB), "
+                         "commit floor %llu MiB, poll %d ms, trim %s, priority %s, notify %s, predictive %s\n",
+                         backend,
+                         (unsigned long long) g.keep_free_mib, (unsigned long long) g.min_avail_mib,
+                         (unsigned long long) g.emergency_mib, (unsigned long long) g.min_commit_mib, g.poll_ms,
+                         trim_name, g.priority ? "on" : "off", g.notify ? "on" : "off", g.predictive ? "on" : "off");
+        } else {
+            std::fprintf(stderr, "strata generate: --memory-guard: %s\n", guard_why.c_str());
+        }
+    }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -1431,6 +1520,16 @@ int main(int argc, char** argv) {
     }
     if (o.resident_cpu_experts && (!o.layer_split.empty() || remote_caches)) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
+        return 2;
+    }
+    if (o.tiered_experts && (o.mmap_experts || o.resident_cpu_experts)) {
+        std::fprintf(stderr, "strata generate: --tiered-experts replaces --mmap-experts/--resident-experts; "
+                             "pick one expert source\n");
+        return 2;
+    }
+    if (o.tiered_experts && o.expert_profile.empty()) {
+        std::fprintf(stderr, "strata generate: --tiered-experts needs a static --expert-profile (the PINNED tier is "
+                             "the profile's order past the cache)\n");
         return 2;
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
@@ -2737,8 +2836,21 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::ArenaExpertSource arena_src;
+    strata::core::TieredExpertSource tiered_src;
     strata::core::ExpertSource* srcp = nullptr;
-    if (o.mmap_experts) {
+    if (o.tiered_experts) {
+        // The same file mapping as `--mmap-experts`, but after the cache fill every expert is sorted into VRAM,
+        // PINNED RAM or COLD (see TieredExpertSource).  Unlike `--mmap-experts` this DOES build experts.bin from a
+        // native pack's shard 1 on demand, because the tiered source needs a stable file to read cold blobs from.
+        tiered_src.set_gguf(o.native_preset);
+        if (!tiered_src.open(o.pack, g.n_layers, g.n_expert, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: experts via the tiered source (%s); tiers are set after the cache fill\n",
+                     tiered_src.note().c_str());
+        srcp = &tiered_src;
+    } else if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
         // mode: the experts come from the file through the OS cache instead of a pinned copy in RAM, for a PC whose
@@ -3167,6 +3279,10 @@ int main(int argc, char** argv) {
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
 
+    // `tiered_src.settle` runs AFTER the layer-split stages and the CUDA1..3 helpers are filled (below), because
+    // the PINNED tier must not spend its budget on a blob another VRAM tier already holds.  See the mask.
+    std::vector<uint8_t> vram_elsewhere;   ///< per pair: a stage or a CUDA1..3 helper holds it
+
     std::array<strata::core::RemoteExperts, 3> remote_experts;
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
@@ -3233,14 +3349,14 @@ int main(int argc, char** argv) {
         } else {
             by_device[0] = std::move(ranked);
         }
-        std::vector<uint8_t> claimed((size_t) g.n_layers * (size_t) g.n_expert, 0);
+        vram_elsewhere.assign((size_t) g.n_layers * (size_t) g.n_expert, 0);
         for (auto& st : stages)   // a layer split: what a stage's cache holds is no helper's
             for (const auto& pr : st->profile)
                 if (st->cache.slot_of(pr.first, pr.second) >= 0)
-                    claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+                    vram_elsewhere[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
             if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
-                     g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err)) {
+                     g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, vram_elsewhere, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -3267,6 +3383,35 @@ int main(int argc, char** argv) {
                              "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+        // the cascade's PINNED tier must not pin a pair the peer already holds (the peer is another VRAM tier,
+        // like a stage or a CUDA1..3 helper): mark it so settle() excludes it.
+        if (o.tiered_experts) {
+            if (vram_elsewhere.empty()) vram_elsewhere.assign((size_t) g.n_layers * (size_t) g.n_expert, 0);
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (peer.has(l, e)) vram_elsewhere[(size_t) l * (size_t) g.n_expert + (size_t) e] = 1;
+        }
+    }
+
+    // ---- settle the tiers NOW: the primary cache and every other VRAM tier (a stage, a CUDA1..3 helper, a peer
+    // GPU) are filled, so the PINNED tier is chosen from the pairs no GPU holds and the same blob is never resident
+    // in two tiers.  `vram_elsewhere` is empty when there is no stage and no helper.
+    if (o.tiered_experts) {
+        const int64_t budget = o.host_budget_gib < 0 ? -1 : (int64_t) (o.host_budget_gib * 1073741824.0);
+        // A/B arm (STRATA_LEGACY_PIN): the pre-fix behaviour, where `settle` was told about the primary cache
+        // only, so the PINNED budget went to experts the CUDA1 helper already holds.  Kept because the two differ
+        // in prefill as well as decode: prefill cannot use CUDA1, so it reads those blobs from RAM only when
+        // they are pinned.
+        static const bool legacy_pin = std::getenv("STRATA_LEGACY_PIN") != nullptr;
+        const uint8_t* also = (legacy_pin || vram_elsewhere.empty()) ? nullptr : vram_elsewhere.data();
+        if (legacy_pin) std::fprintf(stderr, "strata generate: STRATA_LEGACY_PIN: pinning the pre-fix set\n");
+        if (!tiered_src.settle(o.expert_cache > 0 ? &xcache : nullptr, also, profile, budget,
+                               (int64_t) (o.host_reserve_gib * 1073741824.0), /*threads=*/8, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: %s\n", tiered_src.note().c_str());
+        mem_mark("settling the expert tiers");
     }
 
     Drive drive;
@@ -3907,6 +4052,7 @@ int main(int argc, char** argv) {
         thits.scratch = drive.d.hit_scratch;
         thits.hit_out = drive.d.hit_out;
         drive.d.host_res = host_res.data();
+        if (o.tiered_experts) tiered_src.set_residency(host_res.data());
         std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device\n",
                      (long long) resident);
     }
@@ -4786,7 +4932,12 @@ int main(int argc, char** argv) {
                 }
             for (auto& st : stages) st->adapt_live = false;
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
-            for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            for (const auto& [i, slot] : pending) {
+                host_res[(size_t) i] = slot;
+                // the swap landed: if the incoming expert was a PINNED blob, VRAM now holds the only copy any
+                // path reads, so drop the pin (see TieredExpertSource::promote_to_vram)
+                if (o.tiered_experts) tiered_src.promote_to_vram(i / g.n_expert, i % g.n_expert);
+            }
             pending.clear();
             res_upload();
         };
@@ -4802,8 +4953,26 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e))) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    if (r[e] < 0) {
+                        if (u[e] < 2.0f) continue;
+                        // A pair the peer GPU computes must not be pulled into the primary cache as well.
+                        if (peer.valid() && peer.has(l, e)) continue;
+                        // A pair a CUDA1..3 helper already computes must not be pulled into the primary cache as
+                        // well: that duplicates GPU work and evicts a genuine miss (settle() has the same rule).
+                        bool on_helper = false;
+                        for (int rr = 0; rr < drive.d.remote_count; ++rr)
+                            if (drive.d.remote[rr] != nullptr && drive.d.remote[rr]->holds(l, e)) {
+                                on_helper = true;
+                                break;
+                            }
+                        if (on_helper) continue;
+                        // A COLD source reads the SSD on the swap path, but excluding cold candidates caps the hit
+                        // rate (measured: 66% vs 86%) because the profile's tail can never be promoted.  Cold is
+                        // therefore allowed; STRATA_ADAPT_NOCOLD=1 is the A/B opt-out (RAM-resident sources only).
+                        static const bool no_cold = std::getenv("STRATA_ADAPT_NOCOLD") != nullptr;
+                        if (no_cold && !srcp->pinned(l, e)) continue;
+                        cand.emplace_back(u[e], e);
+                    } else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -5696,6 +5865,9 @@ int main(int argc, char** argv) {
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
+            // the tiered source's per-tier decode counters (see TieredExpertSource::blob)
+            const int64_t tp0 = tiered_src.pinned_reads(), tc0 = tiered_src.cold_reads();
+            const int64_t tcb0 = tiered_src.cold_read_bytes(), tcp0 = tiered_src.cold_prefetched_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             if (cancelled) finish = "cancel";
@@ -6029,6 +6201,21 @@ int main(int argc, char** argv) {
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
+            if (o.tiered_experts) {
+                // where the CPU's own misses came from: PINNED is locked RAM (a memcpy), COLD is the mapped file
+                // (page faults on the SSD unless begin_layer's async prefetch already had the blob in flight).
+                const int64_t tp = tiered_src.pinned_reads() - tp0;
+                const int64_t tc = tiered_src.cold_reads() - tc0;
+                const int64_t tcp = tiered_src.cold_prefetched_reads() - tcp0;
+                std::fprintf(stderr, "strata serve: tiered decode misses: PINNED %lld (RAM), COLD %lld (SSD, %.1f MB, "
+                                     "%lld prefetched = %.0f%%)\n",
+                             (long long) tp, (long long) tc,
+                             (double) (tiered_src.cold_read_bytes() - tcb0) / 1e6, (long long) tcp,
+                             tc > 0 ? 100.0 * (double) tcp / (double) tc : 0.0);
+            }
+            if (o.tiered_experts && tiered_src.retained_pins() > 0)
+                std::fprintf(stderr, "strata serve: tiered: %lld PINNED blobs promoted to VRAM kept their RAM copy "
+                                     "(the adaptive swap's cheap re-read home)\n", (long long) tiered_src.retained_pins());
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
         return 0;
@@ -6448,7 +6635,12 @@ int main(int argc, char** argv) {
             if (trace_pending)
                 std::fprintf(stderr, "strata: PENDING landed, %zu experts become resident\n", pending.size());
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
-            for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            for (const auto& [i, slot] : pending) {
+                host_res[(size_t) i] = slot;
+                // the swap landed: if the incoming expert was a PINNED blob, VRAM now holds the only copy any
+                // path reads, so drop the pin (see TieredExpertSource::promote_to_vram)
+                if (o.tiered_experts) tiered_src.promote_to_vram(i / g.n_expert, i % g.n_expert);
+            }
             pending.clear();
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
@@ -6479,8 +6671,24 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    if (r[e] < 0) {
+                        if (u[e] < 2.0f) continue;
+                        // A pair a CUDA1..3 helper already computes must not be pulled into the primary cache as
+                        // well: that duplicates GPU work and evicts a genuine miss (settle() has the same rule).
+                        bool on_helper = false;
+                        for (int rr = 0; rr < drive.d.remote_count; ++rr)
+                            if (drive.d.remote[rr] != nullptr && drive.d.remote[rr]->holds(l, e)) {
+                                on_helper = true;
+                                break;
+                            }
+                        if (on_helper) continue;
+                        // A COLD source reads the SSD on the swap path, but excluding cold candidates caps the hit
+                        // rate (measured: 66% vs 86%) because the profile's tail can never be promoted.  Cold is
+                        // therefore allowed; STRATA_ADAPT_NOCOLD=1 is the A/B opt-out (RAM-resident sources only).
+                        static const bool no_cold = std::getenv("STRATA_ADAPT_NOCOLD") != nullptr;
+                        if (no_cold && !srcp->pinned(l, e)) continue;
+                        cand.emplace_back(u[e], e);
+                    } else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });

@@ -240,10 +240,16 @@ def experts_loading_words(args: list, size: str) -> str:
     return f"loading the experts into RAM ({size}) and locking part of them for the GPU."
 
 
-def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
+def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0,
+                  facts: dict | None = None) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
-    people closed the window thinking it had hung.  The warning comes at that step, not after it."""
+    people closed the window thinking it had hung.  The warning comes at that step, not after it.
+
+    `facts` receives what the log shows that the caller needs later - today whether the experts are tiered (the
+    arena is then the whole packed file on SSD, not RAM, so the tight-RAM warning must not fire)."""
+    if facts is None:
+        facts = {}
     gb = 0.0
     if "--native" in args:                              # about the size of the experts it will read
         try:
@@ -275,6 +281,10 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             cut = chunk.rfind(b"\n") + 1
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
+                if "via the tiered source" in line:
+                    # --tiered-experts: the experts stream from the pack on SSD and only a budget is pinned in RAM,
+                    # so `arena_mib` is the whole file and the tight-RAM warning would be a false alarm.
+                    facts["tiered"] = True
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
                     say("arena", f"[strata] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
@@ -315,6 +325,7 @@ class StrataEngine:
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.start_facts: dict = {}      # what the start log showed (narrate_start): e.g. tiered experts
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.silent_note = None
@@ -329,7 +340,7 @@ class StrataEngine:
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
         if log:
-            threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
+            threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading, 20.0, self.start_facts),
                              daemon=True).start()
             # once per log: the follower keeps reading the same (appended) log across restarts and reloads
             if os.environ.get("STRATA_REQUEST_LINES") and os.path.abspath(log) not in _echoing:
@@ -661,8 +672,17 @@ class Vision:
             args += ["--threads", str(cfg["threads"])]
         if cfg.get("max_tokens"):
             args += ["--max-tokens", str(cfg["max_tokens"])]
+        # "device" (optional): the CUDA device the ENCODER runs on, numbered as nvidia-smi does.  The encoder holds
+        # ~1 GiB for its whole life and runs on its own, so leaving it on CUDA0 takes that VRAM from the expert
+        # cache (the engine sizes the cache from what is free, and the encoder started first).  Pointing it at a
+        # secondary card keeps CUDA0's cache whole.  Omitted or null = the same devices as the engine (the old
+        # behaviour, and what a single-GPU PC must use).
+        venv = env
+        if cfg.get("device") is not None:
+            venv = dict(env) if env else dict(os.environ)
+            venv["CUDA_VISIBLE_DEVICES"] = str(cfg["device"])
         self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
-        self.spawn = (args, log, env)                   # to start it again after an unload
+        self.spawn = (args, log, venv)                  # to start it again after an unload
         self.stopped = False
         self._start()
         self.lock = threading.Lock()
@@ -791,10 +811,14 @@ def engine_silence_s(cfg: dict) -> float:
 
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
-    config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
+    config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32").  Set it to null
+    (or "none"/"off") to keep every GPU visible WITHOUT splitting: the extra cards then run only expert caches
+    (--expert-cache-device1..3, docs/SECOND_GPU.md)."""
     args = list(cfg["args"])
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
-        args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
+    split = cfg.get("layer_split", "auto")
+    split_off = split is None or str(split).strip().lower() in ("", "none", "off")
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and not split_off:
+        args += ["--layer-split", str(split or "auto")]
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
     if len(gpu_list(cfg)) > 1 and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
         args.append("--split-skip-if-fits")
@@ -2524,10 +2548,15 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-def warn_tight_ram(arena_mib) -> None:
+def warn_tight_ram(arena_mib, tiered: bool = False) -> None:
     """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
     system, the engine and this server, Linux ends the engine mid-answer when memory runs out (issue #27) and Windows
-    pages to disk; say so at start instead of after a lost answer."""
+    pages to disk; say so at start instead of after a lost answer.
+
+    NOT when the experts are TIERED (--tiered-experts, `tiered` from narrate_start): `arena_mib` is then the whole
+    packed arena on SSD and only a budget of it is pinned in RAM, so this would warn on a machine that is fine."""
+    if tiered:
+        return
     if not isinstance(arena_mib, int) or arena_mib <= 0:
         return
     try:
@@ -2913,8 +2942,10 @@ def main() -> int:
                             env=vision_env(cfg, env))
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
-        if len(gpu_list(cfg)) > 1:
-            print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
+        eargs = engine_args(cfg)               # the single source of truth for the split (layer_split null = off)
+        if "--layer-split" in eargs:
+            print(f"[strata] layer split across GPUs {gpu_list(cfg)} "
+                  f"({eargs[eargs.index('--layer-split') + 1]})", flush=True)
         # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
         # it is told about (WinError 2), so it is made absolute here
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
@@ -2922,9 +2953,9 @@ def main() -> int:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
+        engine = StrataEngine(exe, eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
-        warn_tight_ram(engine.info.get("arena_mib"))
+        warn_tight_ram(engine.info.get("arena_mib"), bool(getattr(engine, "start_facts", {}).get("tiered")))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop())
         if note:                                        # #560 #516: before --open starts a browser on that card

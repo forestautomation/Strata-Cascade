@@ -287,6 +287,24 @@ def ram_gb():
     return 0.0
 
 
+def ram_available_gb():
+    """The RAM the OS reports as usable right now (GiB): Windows' ullAvailPhys, Linux's MemAvailable.
+
+    This is the honest input for the pinned budget - what is actually free when the model boots, not total RAM
+    minus a guess.  It is the same figure the engine reads for `--host-budget-gib auto` (src/core/tiered_source.cpp
+    mem_available(): ullAvailPhys / MemAvailable).  Falls back to `ram_gb() - 3` only on a kernel too old to report
+    MemAvailable."""
+    if WIN:
+        return _memory_status().ullAvailPhys / 2**30
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable"):
+                return int(line.split()[1]) * 1024 / 2**30
+    except OSError:
+        pass
+    return max(0.0, ram_gb() - 3.0)
+
+
 def page_file_gb():
     """The page file's current size (GB) on Windows, None elsewhere.  The graphics card's memory needs room there
     too: under Windows' driver model every allocation on the card is also charged to the commit (RAM + page file),
@@ -383,15 +401,24 @@ def _cpuid_avx2() -> bool:
 
 
 def gpus():
-    """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
-    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
+    """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use).
+
+    `memory.free` (the driver's own free-VRAM figure, the closest setup-side analog to the engine's cudaMemGetInfo)
+    is kept as `vram_free_gb` so the cascade can size a helper cache from what is actually free, not the card's
+    total.  It is None when nvidia-smi cannot report it."""
+    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free,compute_cap,driver_version",
              "--format=csv,noheader,nounits"])
     found = []
     for line in s.strip().splitlines():
         try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+            idx, name, mem, free, cc, drv = [x.strip() for x in line.split(",")]
+            g = {"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
+                 "driver": drv}
+            try:
+                g["vram_free_gb"] = float(free) / 1024.0
+            except ValueError:                              # "N/A" or blank: fall back to the total
+                g["vram_free_gb"] = None
+            found.append(g)
         except ValueError:
             continue
     return found
@@ -596,8 +623,12 @@ def split_mmap(cfg: dict) -> bool:
     """#364 #384: the low-RAM mode's resident variant (--resident-experts) has no layer split yet.  A config with it
     that runs on several GPUs reads the experts the GPUs do not hold through the OS file cache instead
     (--mmap-experts: the placement those reports measured 1.3-1.6x faster than one GPU), said plainly - the engine
-    used to refuse the pair.  True when the config changed."""
+    used to refuse the pair.  True when the config changed.
+
+    Strata-Cascade (--tiered-experts) already supports several GPUs and its own helper caches, so it is left alone."""
     a = cfg.get("args", [])
+    if "--tiered-experts" in a:
+        return False
     if "--resident-experts" not in a:
         return False
     a[a.index("--resident-experts")] = "--mmap-experts"
@@ -650,8 +681,13 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         return cfg
     pair = can[:2]
     cfg["gpus_asked"] = True
-    # #364 #384: the resident low-RAM variant stays on one card unless the user says otherwise (its RAM use is steady)
-    resident = "--resident-experts" in cfg.get("args", [])
+    # #364 #384: the resident low-RAM variant stays on one card unless the user says otherwise (its RAM use is steady).
+    # Strata-Cascade already uses every card (its own helper caches), so it is never offered this switch.
+    args = cfg.get("args", [])
+    if "--tiered-experts" in args:
+        write_config(cfg_path, cfg)
+        return cfg
+    resident = "--resident-experts" in args
     say()
     say("  This PC has " + " and ".join(gpu_name(g) for g in pair) + ": Strata can share the model across both.")
     say("  Together they hold about twice the model's experts and read prompts about 20% faster (docs/MULTI_GPU.md).")
@@ -1127,13 +1163,18 @@ def amd_gpus(sysfs="/sys"):
         except (OSError, ValueError):
             vram = 0.0
         try:
+            used = int((dev / "mem_info_vram_used").read_text()) / 2 ** 30
+            vfree = max(0.0, vram - used)
+        except (OSError, ValueError):
+            vfree = None
+        try:
             name = (dev / "product_name").read_text().strip() or f"AMD Radeon ({arch})"
         except OSError:
             name = f"AMD Radeon ({arch})"
         if name == f"AMD Radeon ({arch})" and arch in AMD_NAMES:
             name = AMD_NAMES[arch]
         found.append({"index": len(found), "name": name, "vram_gb": vram, "arch": arch, "driver": "amdgpu",
-                      "vendor": "amd"})
+                      "vram_free_gb": vfree, "vendor": "amd"})
     return found
 
 
@@ -1296,7 +1337,7 @@ def amd_gpus_windows(adapters=None, registry=None) -> list[dict]:
         arch = win_amd_arch(did, ad.get("name", ""))
         name = ad.get("name") or AMD_NAMES.get(arch, f"AMD Radeon (device {did:04X})")
         found.append({"index": len(found), "name": name, "vram_gb": vram, "arch": arch or f"unknown (PCI {did:04X})",
-                      "driver": driver or "amd", "vendor": "amd"})
+                      "driver": driver or "amd", "vram_free_gb": None, "vendor": "amd"})
     return found
 
 
@@ -2023,11 +2064,118 @@ DATA_ITEMS = ("models", "packs", "mtp")
 LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other buffers, the server
 RESIDENT_ENGINE = (0, 1, 30)   # the first engine with --resident-experts (the low-RAM mode's resident variant)
 
+_TIERED_PROBE: dict = {}   # engine exe -> bool; the --help probe runs once per path per process
+
+
+def tiered_engine(eng: Path | None) -> bool:
+    """Whether the installed engine is this fork's ported one, i.e. it knows --tiered-experts.
+
+    The fork re-lands on an upstream whose version number is the same as everyone's, so the version cannot identify
+    it.  Instead ask the binary itself: `strata --help` lists `--tiered-experts` only in the ported engine.  This
+    mirrors how engine_version() already reads the binary, needs no change to the engine, and returns False on any
+    error (a missing or unreadable engine just keeps the upstream behaviour)."""
+    if eng is None:
+        return False
+    exe = Path(eng) / EXE
+    key = str(exe)
+    if key in _TIERED_PROBE:
+        return _TIERED_PROBE[key]
+    found = False
+    try:
+        if exe.exists():
+            # --help prints the flags and exits; a short timeout keeps a wedged binary from hanging setup
+            r = subprocess.run([str(exe), "--help"], capture_output=True, text=True, timeout=20)
+            found = "--tiered-experts" in (r.stdout or "") + (r.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        found = False
+    _TIERED_PROBE[key] = found
+    return found
+
+
+def tiered_should_default(model, ram, found) -> bool:
+    """True when the ported engine should default to --tiered-experts: the model's experts do not fit RAM (the same
+    test that picks the low-RAM mode) AND the PC has a second usable GPU to hold a helper cache.
+
+    It looks at the cards setup DETECTED, not the ones chosen: the low-RAM recommendation deliberately picks one GPU
+    for the resident variant, and the cascade's win over that is exactly turning the second card into a helper."""
+    if not low_ram_needed(model, ram):
+        return False
+    return len(together_ok(found or [])) >= 2
+
+
+def tiered_helper_counts(model, chosen) -> list[int]:
+    """--expert-cache-device1..3 for the helper cards (every card after the first): how many experts each can hold.
+
+    A model's expert count is fixed (24,576 for Qwen3.8-Flash-Next) but the bytes per expert differ by quant, so
+    the size comes from the model's own expert-arena size, never a constant.
+
+    Each helper's usable VRAM is **hybrid**: the real free VRAM the driver reports (`vram_free_gb`) minus a small
+    reserve, capped at 82% of the card's total.  This mirrors the engine, which sizes its own cache from
+    `cudaMemGetInfo` free minus the reserve (src/program/generate.cpp) - so a helper is sized from what is actually
+    free, not a flat fraction of the total.  When the free figure is unavailable (e.g. Windows AMD, where only the
+    total is known) it falls back to the 82% cap alone.  An over-large count makes the engine refuse to start rather
+    than clamp, so the 82% ceiling stays even when the free reading is high."""
+    n_experts = 24576
+    per_expert_mib = (MODELS[model]["arena_gb"] * 1024.0) / n_experts
+    counts = []
+    for g in chosen[1:4]:                              # --expert-cache-device1..3
+        total_mib = g["vram_gb"] * 1024.0
+        cap_mib = max(0.0, total_mib * 0.82)
+        free = g.get("vram_free_gb")
+        if free is not None:
+            # the same ~512 MiB the engine keeps free (its "512-MiB-free" rule), and never above the 82% cap
+            usable_mib = min(cap_mib, max(0.0, free * 1024.0 - VRAM_HELPER_RESERVE_MIB))
+        else:
+            usable_mib = cap_mib
+        counts.append(max(0, int(usable_mib / per_expert_mib)))
+    return counts
+
+
+# VRAM kept free on a helper card beside its expert cache (the engine's own 512-MiB-free rule).
+VRAM_HELPER_RESERVE_MIB = 512.0
+
 
 def low_ram_needed(model, ram) -> bool:
     """The model's experts do not fit this PC's RAM with room left for the rest: they are then mapped from the pack's
     experts.bin instead of copied into RAM (the low-RAM mode)."""
     return ram < MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB
+
+
+# The pinned budget's ceiling in the engine (STRATA_PIN_CAP_GIB default) and the measured sweet spot on a 16 GB
+# primary with a helper: above ~6 GiB the pinned budget competes with CUDA0's cache for the prefill borrow, and 8 GiB
+# failed outright in prefill (only 0 MiB free, "shrinking the expert cache").  See STRATA-CASCADE.md section 4.1.
+CASCADE_BUDGET_CAP_GIB = 6.0
+
+
+def cascade_host_budget(helpers, avail_gb=None, primary_gib=None, reserve_gib=None) -> str:
+    """The --host-budget-gib value setup writes for the cascade.
+
+    With a **helper** (a card after the first) the pinned budget shares the machine with CUDA0's expert cache, so it
+    is capped rather than left at `auto` - on a 32 GB PC `auto` is MemAvailable minus the reserve (~9-10 GiB), which
+    over-commits the 16 GB primary and can run out of VRAM in prefill.  With no helper, `auto` is the right value:
+    the engine sizes it from MemAvailable, and more pinned is better on one card.
+
+    The number follows the engine's own `auto` rule (src/core/tiered_source.cpp): **the real RAM the OS reports free,
+    minus a reserve**.  `avail_gb` is that free figure (ram_available_gb(): ullAvailPhys / MemAvailable), and the
+    default reserve is the engine's own `--host-reserve-gib` default.  On top of that the pin is held at or below the
+    measured 6 GiB beside a helper (above it, the pin competes with CUDA0's cache for the prefill borrow; 8 GiB failed
+    outright - STRATA-CASCADE.md 4.1), and below ~45% of the primary card.  A minimum of 2 GiB keeps the pin useful on
+    a very small box; the engine's own headroom check remains the final word at start."""
+    if not any(n > 0 for n in helpers):
+        return "auto"
+    cap = CASCADE_BUDGET_CAP_GIB
+    if reserve_gib is None:
+        reserve_gib = HOST_RESERVE_GIB
+    if avail_gb is not None:
+        cap = min(cap, max(0.0, avail_gb - reserve_gib))
+    if primary_gib:
+        cap = min(cap, max(2.0, primary_gib * 0.45))
+    return "%g" % max(2.0, round(cap, 1))
+
+
+# The RAM kept free beside the pinned tier, matching the engine's `--host-reserve-gib` default (8 GiB): room for the
+# OS, the engine's own buffers, the KV cache and the cold tier's page cache.  See src/program/generate.cpp.
+HOST_RESERVE_GIB = 8.0
 
 
 def low_ram_gpu_gb(model, vram_gb, ctx=32768, kv="int8") -> float:
@@ -2532,6 +2680,43 @@ def saved_calibration(cfg: dict) -> dict | None:
     return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
 
 
+def tune_cascade_config(cfg_path: Path, cfg: dict, free_gib: float, helper_gibs: list[float]) -> bool:
+    """Sweep a few cascade layouts on the 32K/5K bench (tools/cascade_bench) and adopt the winner.
+
+    Unlike calibrate_config this STARTS the model once per layout, so it is opt-in (--tune-cascade) and slow.  Any
+    failure leaves the layout setup wrote in place: tuning never stops an install."""
+    tuner = ROOT / "tools" / "cascade_bench" / "tune_cascade.py"
+    if not tuner.is_file():
+        warn("the cascade tuner is missing (tools/cascade_bench/tune_cascade.py): the layout setup wrote stays")
+        return False
+    say()
+    say("  Tuning the cascade layout for this PC: the tuner starts the model once per layout (a few around the")
+    say("  pinned RAM budget and the second GPU's cache) and benches each on a 32K prompt / 5K reply. It takes a")
+    say("  while; the PC is busy meanwhile.")
+    cmd = [sys.executable, str(tuner), "--config", str(cfg_path), "--python", sys.executable,
+           "--port", str(cfg.get("port") or 8080), "--free-gib", f"{free_gib:.1f}"]
+    if helper_gibs:
+        cmd += ["--helper-gib", ",".join(f"{g:.2f}" for g in helper_gibs)]
+    started = time.time()
+    try:
+        rc = subprocess.call([str(c) for c in cmd], cwd=str(ROOT))
+    except Exception as e:                             # never stops an install: the layout setup wrote stays
+        warn(f"the cascade tuning did not run ({e}): the layout setup wrote stays")
+        return False
+    if rc != 0:
+        warn("the cascade tuning did not finish (see the output above): the layout setup wrote stays")
+        return False
+    out_dir = ROOT / "tools" / "cascade_bench"
+    winners = [p for p in out_dir.glob("tune-*-best.json") if p.stat().st_mtime >= started - 1]
+    if not winners:
+        warn("the cascade tuning reported no winning layout: the layout setup wrote stays")
+        return False
+    best = max(winners, key=lambda p: p.stat().st_mtime)
+    shutil.copyfile(best, cfg_path)
+    ok(f"cascade layout tuned for this PC and saved to {cfg_path.name} (from {best.name})")
+    return True
+
+
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     """Configs written before v0.1.13 read prompts in fixed 2048-token chunks; the engine now picks the chunk
     itself (`--prefill auto`: up to 8192, as the free VRAM allows - about 2x faster on long prompts).  Under WSL,
@@ -2965,15 +3150,20 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
+    ap.add_argument("--tune-cascade", action="store_true",
+                    help="tune the Strata-Cascade tier layout for this PC (starts the model once per layout; about "
+                         "10-20 minutes), then start the model")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM, English answers 1-2%% faster), cyrillic = English, code "
                          "and the Cyrillic script (Ukrainian, Russian... answers decode ~30%% faster)")
-    ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap"], default="auto",
+    ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap", "tiered"], default="auto",
                     help="read the model's experts from one file in its folder instead of copying them all into RAM "
                          "(for a PC with a big GPU and little RAM); auto: when the experts would not fit the RAM. In "
                          "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
-                         "else read through the OS file cache (mmap); resident / mmap force one of the two")
+                         "else read through the OS file cache (mmap); resident / mmap force one of the two. tiered: the "
+                         "cascading source (VRAM + a pinned RAM budget + a second GPU's cache + the SSD at once) - only "
+                         "the Strata-Cascade engine has it, and it needs a second GPU to beat the other two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
                     help="UD-Q4_K_XL: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
                          "more is kept as you choose, with a note)")
@@ -3142,6 +3332,7 @@ def main() -> int:
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
+    ram_avail = ram_available_gb()      # the OS's real free figure, read once at start (before the model loads)
     cpu, avx2, avx512 = cpu_info()
     need = min(d["ram_gb"] for d in MODELS.values())
     low_ok = low_ram_fits("IQ1_M", ram, gpu["vram_gb"]) and a.low_ram != "off"   # the smallest model, mapped
@@ -3253,9 +3444,9 @@ def main() -> int:
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
         warn(f"--resident-budget-gib is for UD-Q4_K_XL: {model} keeps all of its experts in RAM or in the low-RAM mode")
-    low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
+    low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap", "tiered") or
                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
-    if low_ram and multi and not low_ram_together(a, model, ram, gpu, chosen):
+    if low_ram and multi and a.low_ram != "tiered" and not low_ram_together(a, model, ram, gpu, chosen):
         multi, sel, chosen = [], [gpu["index"]], [gpu]
     # (the low-RAM mode's variant is decided once the context is known, below; on several GPUs it is the mapped one)
     if not low_ram and budget is None and ram < MODELS[model]["ram_gb"] - 4:
@@ -3341,19 +3532,24 @@ def main() -> int:
     # with a warning when they do not fit the RAM it finds free).  mmap: they are read through the OS file cache.
     # The GPU's share: its VRAM less the dense weights and buffers, this context's KV cache and the image encoder's room.
     resident = False
+    tiered = False        # the cascading source; resolved against the installed engine below (only the port has it)
     if low_ram:
         arena = MODELS[model]["arena_gb"]
         vram = gpu["vram_gb"] - (VISION[vision]["reserve_mib"] / 1024 if vision != "none" else 0)
         share = low_ram_gpu_share(model, vram, ctx, kv)
         rest = arena - low_ram_gpu_gb(model, vram, ctx, kv)
-        resident = a.low_ram == "resident" or (a.low_ram != "mmap" and low_ram_resident(model, ram, vram, ctx, kv))
+        if a.low_ram == "tiered":
+            tiered = True
+        resident = (a.low_ram == "resident"
+                    or (a.low_ram not in ("mmap", "tiered") and low_ram_resident(model, ram, vram, ctx, kv)))
         if multi:      # #364 #384: every chosen card's share (the image encoder on the main one), the mapped variant
             held = min(arena, low_ram_gpu_gb(model, vram, ctx, kv) +
                        sum(low_ram_gpu_gb(model, x["vram_gb"], ctx, kv) for x in chosen[1:]))
             share, resident = held / arena, False
-            ok(f"low-RAM mode on {len(chosen)} GPUs: {model}'s experts ({arena:.0f} GB) are read from the model folder "
-               f"through the OS file cache instead of a copy in RAM ({ram:.0f} GB); the GPUs hold ~{100 * share:.0f}% "
-               "of them")
+            if not tiered:
+                ok(f"low-RAM mode on {len(chosen)} GPUs: {model}'s experts ({arena:.0f} GB) are read from the model "
+                   f"folder through the OS file cache instead of a copy in RAM ({ram:.0f} GB); the GPUs hold "
+                   f"~{100 * share:.0f}% of them")
             if share < 0.6:
                 warn("most of the experts are read from the SSD while it answers: expect it to be much slower than "
                      "with enough RAM (a faster SSD and a smaller size help)")
@@ -3366,6 +3562,9 @@ def main() -> int:
             if share < 0.6:
                 warn("most of the experts are read from the SSD while it answers: expect it to be much slower than "
                      "with enough RAM (a faster SSD and a smaller size help)")
+        if tiered:
+            ok(f"cascade: the hottest experts stay in VRAM, a pinned RAM budget beside them, and the rest stream "
+               f"from the SSD (this needs the Strata-Cascade engine)")
     # EXPERIMENTAL: the experimental-speed-projection control vector (data/experimental-speed-projection), off unless
     # chosen here; with it loaded, the web app and the API switch it off per request
     esp = None
@@ -3453,6 +3652,36 @@ def main() -> int:
         fail(f"{model} needs engine {'.'.join(map(str, UNSLOTH_ENGINE))} or newer; this one is {meta.get('version')}",
              "update Strata (or compile the engine with --build) and run setup again")
     ok(f"engine: {eng / EXE}")
+    # Strata-Cascade: only the ported engine knows --tiered-experts.  Resolve the low-RAM variant against what is
+    # actually installed: an explicit --low-ram tiered on an upstream engine falls back to the usual mode with a
+    # warning; on auto, the port + a second GPU make the cascade the default for a PC whose RAM cannot hold the model.
+    ported = tiered_engine(eng)
+    if tiered and not ported:
+        tiered = False
+        warn("--low-ram tiered needs the Strata-Cascade engine (this one has no --tiered-experts): using the usual "
+             "low-RAM mode instead. Install Strata-Cascade to use it.")
+    elif not tiered and ported and a.low_ram == "auto" and low_ram and tiered_should_default(model, ram, found):
+        tiered = True
+        if not multi:                                  # the cascade turns the second card into a helper cache
+            pair = together_ok(found)[:2]
+            chosen, sel = [gpu_info(g["index"]) for g in pair], [g["index"] for g in pair]
+            multi, gpu = sel, chosen[0]
+        ok("cascade: this PC's RAM does not hold the model and it has a second GPU, so the experts are spread across "
+           "VRAM, a pinned RAM budget and the SSD (Strata-Cascade). Turn it off with --low-ram resident")
+    elif not tiered and ported and a.low_ram == "auto" and low_ram and not multi:
+        # One card, RAM too small: ask, and recommend the cascade.  This fork IS the cascade fork, so the default
+        # here is y: its measured one-card win is prefill (~2x, ~960 vs 434 t/s) while decode is about the same, and
+        # its *pinned* RAM budget holds steady where the resident mode's decode depends on the OS file cache staying
+        # warm (it thrashed the page file at 128K - #250).
+        say()
+        say("  This PC's RAM does not hold the model and it has one GPU.")
+        say("  The cascade pins a slice of RAM for the hottest experts and streams the rest from the SSD: it holds")
+        say("  steady RAM use where upstream's resident mode can thrash the page file, and reads prompts ~2x faster")
+        say("  - decode is about the same. Two cards are what make it much faster.")
+        if ask("  Use the cascade on this card?", ["y", "n"], "y", a.yes) == "y":
+            tiered = True
+            ok("cascade: the experts are spread across VRAM, a pinned RAM budget and the SSD (Strata-Cascade). "
+               "Turn it off with --low-ram resident")
 
     # ---- 5. the model files
     step(5, f"downloading {fam['title']} {model}")
@@ -3560,7 +3789,21 @@ def main() -> int:
         ok(f"low-RAM mode: engine {meta.get('version')} has no resident variant yet; the experts are read through "
            "the OS file cache (run setup again after the next engine update)")
     if low_ram:   # the experts from the pack's experts.bin: the ones the GPU does not hold copied into RAM, or mapped
-        args += ["--resident-experts" if resident else "--mmap-experts"]
+        if tiered:
+            # the cascading source: a pinned RAM budget + a helper cache on every card after the first
+            helpers = tiered_helper_counts(model, chosen)
+            primary_gib = chosen[0]["vram_gb"] if chosen else None
+            cascade_budget = cascade_host_budget(helpers, avail_gb=ram_avail, primary_gib=primary_gib)
+            args += ["--tiered-experts", "--host-budget-gib", cascade_budget]
+            for i, n in enumerate(helpers, 1):
+                if n > 0:
+                    args += [f"--expert-cache-device{i}", str(n)]
+            ok("cascade: --tiered-experts --host-budget-gib " + cascade_budget
+               + "".join(f" --expert-cache-device{i} {n}" for i, n in enumerate(helpers, 1) if n > 0)
+               + (" (capped beside the helper: a larger pin competes with CUDA0's cache)"
+                  if cascade_budget != "auto" else ""))
+        else:
+            args += ["--resident-experts" if resident else "--mmap-experts"]
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 7.5 KB with 4-bit, so only when it fits.
@@ -3673,6 +3916,16 @@ def main() -> int:
         tuned = calibrate_config(cfg_path)
     else:
         tuned = None                                   # not asked for: nothing to repeat below
+    tuned_cascade = None
+    if tiered:                                         # the cascade layout depends on this PC's RAM and second GPU
+        again = "START-HERE.bat" if WIN else "./setup.sh"
+        if a.tune_cascade or (not a.yes and not a.no_start and ask(
+                "Tune the cascade layout for this PC now? It starts the model once per layout (about 10-20 minutes; "
+                f"the PC is busy meanwhile; later: {again} --tune-cascade)", ["y", "n"], "n", a.yes) == "y"):
+            tuned_cascade = tune_cascade_config(
+                cfg_path, cfg, ram - 3, [g.get("vram_gb", 0.0) * 0.82 for g in chosen[1:4]])
+    elif a.tune_cascade:
+        warn("--tune-cascade: this PC or model is not using the cascade (no --tiered-experts), so there is nothing to tune")
     ok(f"start script: {script.name}")
 
     say()
@@ -3688,6 +3941,9 @@ def main() -> int:
     if tuned is False:                                 # #447: a failed tuning is repeated here, not only above
         say("  Tuning:           FAILED (the reason is above): the default settings stay - "
             f"{'START-HERE.bat' if WIN else './setup.sh'} --calibrate tries again")
+    if tiered:
+        say("  Cascade layout:  " + (f"tuned for this PC, saved to {cfg_path.name}" if tuned_cascade
+            else f"not tuned - run {'START-HERE.bat' if WIN else './setup.sh'} --tune-cascade to fit it"))
     if a.no_start:
         return 0
     return start(cfg_path, port)

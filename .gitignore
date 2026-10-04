@@ -51,3 +51,23 @@ build-vision.bat
 /third_party/*.zip
 
 /.rocm-win/
+
+# generated, not source: the shipped layout tuner and guard harness write result
+# configs, CSV matrices, run configs, samples and logs beside themselves.  They hold
+# absolute model paths and machine-specific settings, so a run must never reach a PR.
+# tune_cascade.py and guard-test.ps1 both take --out; redirect them elsewhere to keep
+# results.  guard/example-config.json is the tracked template and is kept.
+/tools/cascade_bench/tune-*.json
+/tools/cascade_bench/tune-*.csv
+/tools/cascade_bench/guard/*.json
+!/tools/cascade_bench/guard/example-config.json
+/tools/cascade_bench/guard/*.samples.csv
+/tools/cascade_bench/guard/*.bench.log
+/tools/cascade_bench/guard/*.console.log
+/tools/cascade_bench/guard/*.console.log.err
+/tools/cascade_bench/guard/*.bench.log.err
+/tools/cascade_bench/guard/*.hog.log
+/tools/cascade_bench/guard/*.hog.log.err
+/tools/cascade_bench/guard/*.harness.log
+/tools/cascade_bench/guard/*.engine.log
+/tools/cascade_bench/guard/*.pid

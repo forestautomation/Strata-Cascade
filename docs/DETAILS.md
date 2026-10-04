@@ -272,7 +272,7 @@ You need **only a graphics driver**: NVIDIA 580 or newer (update it with the NVI
 [nvidia.com/drivers](https://www.nvidia.com/drivers)), or for AMD the one in [INSTALL.md](INSTALL.md#what-you-need).
 Everything else is installed for you the first time.
 
-| | |
+| Requirement | Detail |
 | --- | --- |
 | GPU | NVIDIA **RTX 20, 30, 40 or 50 series**, **12 GB VRAM or more** (8 GB runs, slowly). Measured on an RTX 5070 and an RTX 3090; RTX 20 (Turing, since 0.1.27) was tested by a contributor on an RTX 2070. Or AMD **Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700, RX 6800 / 6900 series**: [AMD_HIP.md](AMD_HIP.md). |
 | RAM | **64 GB** recommended (see the table above). |
@@ -860,6 +860,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | `port 8080 is already in use` | Strata is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
 | `cudaHostRegister ... out of memory` in the log | Normal on Windows: the engine pins the experts in per-layer slices instead. Only a problem if the load then fails. |
 | `ExpertCache: cudaMalloc(...) failed: out of memory` although VRAM is free | Windows' page file is off or tiny: every allocation on the graphics card is also charged to Windows' commit (RAM + page file). Set the page file to "System managed" (System > About > Advanced system settings > Performance > Advanced > Virtual memory) and restart. Since 0.1.19 the engine retries with a smaller cache instead of stopping, and setup warns about a page file under 4 GB (issue #60). |
+| The whole PC stutters or freezes while generating and the page file is on a slow disk | Opt in to `--windows-memory-guard`: it lets RAM fill, then on the OS's low-memory signal (or a fast decline) lowers the engine's memory priority, pauses cold prefetch and releases its cheap, SSD-backed pages - a `soft` working-set ceiling by default, `hard` = `EmptyWorkingSet` now - so Windows reclaims the engine instead of paging other apps out (see docs/TUNING.md section 1b). The real fix is a page file on an SSD. |
 | The first start takes minutes | It is reading 34-55 GB into RAM; the second start is faster while the files are in the OS cache. |
 | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, pins part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer - usually out of RAM (Linux ends the biggest program: `sudo dmesg \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats: close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |

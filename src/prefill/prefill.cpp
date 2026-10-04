@@ -211,11 +211,15 @@ struct Alloc {
 // j - kRing (recorded by the launching thread, `issued`) is done.
 struct Stager {
     // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
-    // DMAs of the unpinned experts' blobs
+    // DMAs of the unpinned experts' blobs.  The tiered source streams from the SSD and wants a deeper ring.
+    static constexpr int kRingSsd = 48;
     int kRing = 16;
     // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
     // role slices; a pointer to it would not live as long as the queue)
     struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
+    /// set only for a source that streams from the SSD: it reads a cold expert with one unbuffered read instead of
+    /// ~400 page faults through the mapping.  Null = memcpy.
+    const strata::core::ExpertSource* source = nullptr;
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
@@ -234,7 +238,8 @@ struct Stager {
     std::vector<std::thread> threads;
     int device = 0;
 
-    bool init(size_t blob_bytes, int nthreads) {
+    bool init(size_t blob_bytes, int nthreads, int ring) {
+        kRing = ring;
         if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
         buf.assign((size_t) kRing, nullptr);
         pinned.assign((size_t) kRing, 0);
@@ -285,10 +290,15 @@ struct Stager {
                 // was a ring entry the routing skipped (an event never recorded returns at once)
                 cudaEventSynchronize(dma_done[b]);
                 const Job& jb = jobs[(size_t) j];
-                if (jb.from == nullptr) std::memcpy(buf[b], jb.src, jb.bytes);
-                else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
-                    std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
-                    std::abort();
+                if (jb.from != nullptr) {
+                    if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
+                        std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
+                        std::abort();
+                    }
+                } else if (source != nullptr) {
+                    source->read_into(jb.src, buf[b], jb.bytes);
+                } else {
+                    std::memcpy(buf[b], jb.src, jb.bytes);
                 }
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
@@ -703,16 +713,23 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
-        const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
-        // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are page faults on the
-        // SSD, so the copies need many reads in flight - 32 threads and a 128-deep ring read a 4K chunk in 29 s
-        // instead of 71 s on an RTX 5070 / NVMe PC (4 threads, 16 deep: the defaults, kept for every other source)
+        // D-5: the host copy threads of unpinned blobs.  Reading cold experts from the SSD, the threads wait on the
+        // device rather than burn CPU, and more of them keep more reads in flight (the NVMe does ~6.5 GB/s with
+        // several streams).  A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are
+        // page faults on the SSD, so the copies need many reads in flight - 32 threads and a 128-deep ring read a 4K
+        // chunk in 29 s instead of 71 s on an RTX 5070 / NVMe PC (4 threads, 16 deep: the defaults, kept for every
+        // other source)
+        const bool ssd = src != nullptr && src->streams_from_ssd();
         bool files = false;
         for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
             for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
-        if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
-        if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
+        const char* stv = std::getenv("STRATA_STAGER_THREADS");
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32)
+                                : files ? 32
+                                        : (ssd ? std::max(2, std::min(8, hw / 2)) : std::max(2, std::min(4, hw / 4)));
+        const int ring = files ? 4 * threads : (ssd ? Stager::kRingSsd : 16);
+        if (!m.stager->init((size_t) MAXBLOB(), threads, ring)) ok = false;
+        if (ssd) m.stager->source = src;
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);

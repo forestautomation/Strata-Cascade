@@ -41,32 +41,39 @@ either do not fit or the answer stalls on the disk. That is the exact case this 
 
 ## Why it runs faster
 
-**What this build is:** upstream Strata **v0.1.38** plus the cascade port - the *same* upstream base, so the numbers
-below isolate the fork and nothing else. Two ideas do the work, and both show up as raw numbers (same PC, same model,
+**What this build is:** upstream Strata **v0.1.39** (`origin/main` `6f32ec0`) plus the cascade port - the *same* upstream
+base, so the numbers below isolate the fork and nothing else. Two ideas do the work, and both show up as raw numbers (same PC, same model,
 same context - full method in [`STRATA-CASCADE.md`](STRATA-CASCADE.md)):
+
+**Test rig:** AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB (PCIe 4.0 x8/x8),
+SK hynix P41 2 TB (PCIe 4.0) SSD, Windows 11.
 
 | What changed | Stock upstream | Strata-Cascade | |
 | --- | ---: | ---: | --- |
-| **Decode** - writes answers | 37.9 t/s | **50.1 t/s** | **1.3x** |
-| **Prefill** - reads your prompt | 245 t/s | **844 t/s** | **3.4x** |
-| **Expert-cache hit rate** | 54.9% | **87.6%** | fewer disk reads |
+| **Decode** - writes answers | 42.5 t/s | **51.8 t/s** | **1.2x** |
+| **Prefill** - reads your prompt | 253 t/s | **900 t/s** | **3.6x** |
+
+The cascade's win is not the cache hit rate: upstream's newer cache path (`--remote-expert-opt`, on in the stock
+arm) brings stock to the same ~87% (see **Results**). It is **keeping the SSD reads in flight** and **spending
+every tier once**:
 
 - **Prefetch, don't stall.** A ring of up to ~48 SSD reads stays in flight while the GPU computes the previous
-  layer. Upstream beside a helper reads each miss synchronously - which is why its prompt reading stalls at 245 t/s.
+  layer. Upstream beside a helper reads each miss synchronously - which is why its prompt reading stalls at 253 t/s.
 - **Spend every tier once.** `settle` sorts each expert into exactly one of VRAM / pinned RAM / SSD, so no expert is
   duplicated on a card and in RAM, and the pinned budget goes only to blobs *no* GPU computes.
 
 ## Results
 
 **Qwen3.8-Flash-Next IQ3_XXS, 128K context** (8-bit KV), 32K prompt / 5K reply,
-vision on. Both current arms are fresh builds of the **same** upstream base (v0.1.38, `origin/main` `db4f91a`), one
-run each, on the same PC. The model is ISTA-DASLab's [IQ3_XXS quant](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS)
+vision on. Both current arms are fresh builds of the **same** upstream base (v0.1.39, `origin/main` `6f32ec0`), one
+run each, on the same PC (AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB over PCIe 4.0 x8/x8,
+SK hynix P41 2 TB SSD, Windows 11). The model is ISTA-DASLab's [IQ3_XXS quant](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS)
 of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) - the exact one setup downloads:
 
 | Config | Decode | Prefill | Cache hit |
 | --- | ---: | ---: | ---: |
-| Upstream, dual-GPU (`--mmap-experts` + CUDA1 helper) | 37.9 t/s | 245.0 t/s | 55% |
-| **Strata-Cascade, 2 cards** | **50.1 t/s** | **844.5 t/s** | **87.6%** |
+| Upstream, dual-GPU (`--mmap-experts` + CUDA1 helper + `--remote-expert-opt`) | 42.5 t/s | 252.9 t/s | 87.4% |
+| **Strata-Cascade, 2 cards + memory guard** | **51.8 t/s** | **900.5 t/s** | **86.2%** |
 | Strata-Cascade, 1 card (`--low-ram tiered`) | 28.2 t/s | ~960 t/s | 38% |
 | Upstream, low-RAM mode, 1 GPU (`--resident-experts`) | 7.6 t/s \* | ~200 t/s \* | 37% |
 
@@ -74,8 +81,14 @@ of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) - the ex
 a warm OS file cache it posts 29.7 t/s / 434 t/s, so it lives or dies by the page cache. The cascade does not - its
 RAM budget is *pinned*.
 
+The current best two-card run adds the **memory guard** (see
+[`STRATA-CASCADE.md`](STRATA-CASCADE.md#the-memory-guard-opt-in)) to the layout above: 51.8 t/s decode / 900.5 t/s
+prefill / 86.2% hit, the fastest measured here. It is a single run; the guard's measured job is to keep the machine
+usable, not to add throughput.
+
 > [!NOTE]
-> Measured on **Windows 11** (Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB). The Linux path is
+> Measured on **Windows 11** (AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB over PCIe 4.0
+> x8/x8, SK hynix P41 2 TB SSD). The Linux path is
 > implemented but **not yet measured** - please share your numbers. Rig, method and every figure:
 > [`STRATA-CASCADE.md`](STRATA-CASCADE.md).
 
@@ -231,6 +244,8 @@ the cascade, upstream's own README applies as-is.
 
 <h1 align="center">Strata</h1>
 
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
@@ -238,15 +253,16 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
-normally needs a server - on a normal PC. It chats, writes code, reads pictures and works with your apps and coding
-agents, and nothing leaves your PC.
+Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
+large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
+and coding agents. Nothing leaves your PC.
 
 ## How fast is it?
 
-Measured on two ordinary gaming PCs. "Writes answers" is how fast the reply appears in a short chat; "reads your
-prompt" is how fast it takes in what you send (a 32K-token document, code or chat history). A token is about ¾ of a
-word, so 60 tokens per second is faster than you can read.
+We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+
+- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
+- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
 
 <table>
 <tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
@@ -271,8 +287,10 @@ word, so 60 tokens per second is faster than you can read.
 </td></tr>
 </table>
 
-A card with more VRAM is faster: an RTX 3090 (24 GB) should write roughly 100-140 tokens per second. Long chats,
-other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size), [community results](docs/COMMUNITY_BENCHMARKS.md).
+NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
+[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
+about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
+[community results](docs/COMMUNITY_BENCHMARKS.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
@@ -281,26 +299,33 @@ other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size), [commu
 
 | | |
 | --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series - with **12 GB of VRAM or more** |
-| **RAM** | 32 GB or more - how much decides [which model](#which-model-should-i-pick) fits; 64 GB runs every size |
-| **Disk** | about 80 GB free, on an SSD if you can (the first start is much faster) |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD |
+| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
+| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
+| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
+| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
 
-Everything else is installed for you. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+
+Experimental, written and tested by community members on their own machines:
+
+- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
+- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
+- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
+
 The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
 
 ## Install
 
 ### Let your AI set it up
 
-Use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
+Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
 
 ```text
 Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
 ```
 
-It checks your graphics card, RAM and disk, picks the model that fits, installs it, starts it and tells you how to
-connect your apps. AI tools can also install, start and stop Strata themselves through its
+It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
+you how to connect your apps. AI tools can also install, start and stop Strata through its
 [MCP server](docs/MCP_SERVER.md).
 
 ### Or do it yourself
@@ -308,43 +333,51 @@ connect your apps. AI tools can also install, start and stop Strata themselves t
 [Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
 **Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
 
-The same steps for NVIDIA and AMD: the installer finds your card and sets up the right engine for it. It asks which
-model, which size, how much context (how much text it keeps in mind) and whether it should read pictures - press
-Enter each time for the recommended answer. Then it downloads the model (~70 GB; you can stop and it continues where
-it left off) and starts it. Your browser opens the Strata app at `http://127.0.0.1:8080`.
+The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
+asks you a few questions:
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
-> loads 35-55 GB into your RAM and locks part of it for the graphics card. That's normal - wait, and don't close the
-> window. The window tells you what it is doing.
+- which model and which size,
+- how much context (how much text the model keeps in mind),
+- whether it should read pictures.
 
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again: it starts right away, nothing is downloaded twice. Close
+Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
+download stops, run it again: it continues where it left off. Your browser opens the Strata app at
+`http://127.0.0.1:8080`.
+
+> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
+> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
+> close the window. The window shows what Strata is doing.
+
+**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
 its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option:
-[docs/INSTALL.md](docs/INSTALL.md).
+several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Which model should I pick?
 
-The installer recommends one for your RAM. The same model comes in sizes that are compressed more or less: smaller
-is faster, larger is a bit smarter.
+The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
+sizes are faster. Larger sizes are a bit smarter.
 
 | Your RAM | Take | Why |
 | --- | --- | --- |
 | **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
 | **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best, and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's 4-bit (experimental) | room for the largest sizes with everything else open |
+| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
+| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
 
-- **[Coder](docs/MODELS.md#coder)** - a coding version with half of the experts removed: 91% of the full model's
-  SWE-bench Verified score (by its authors), fits 32 GB of RAM. Weaker outside code, including Chinese and other
-  CJK text (#438): for those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15)** - a fine-tune that thinks much shorter before it answers, so you get the
-  answer sooner, at about the same quality.
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental) - the closest to the full
-  model, but most of it is read from the SSD while it answers: 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** - a manual setup, not in the
-  installer's menu.
+- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
+  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
+  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
+- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
+  get the answer sooner, at about the same quality.
+- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
+  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
+  while it answers, so it is slower there (an NVMe SSD helps).
+- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
+  model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
+- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
+  not in the installer's menu.
 
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). You can add another model later with
+Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
 `SETUP.bat` (Linux: `./setup.sh --setup`).
 
 ## Using it
@@ -352,62 +385,68 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). You can 
 <p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
 <sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
 
-- **In the browser:** `http://127.0.0.1:8080` - **Chat**, a live **Monitor** of the model and your GPU/CPU/RAM, and
-  **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with base URL **`http://127.0.0.1:8080/v1`**,
-  any API key and any model name. Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-  `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or your app's "reasoning effort". Off is
-  fastest; high is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup, then click **Picture** in the chat, or attach them in your app
-  (AMD cards: on Linux through the processor, not on Windows yet).
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>` - always with a key.
-- **Good to know:** it answers one request at a time. The first message of a chat is read in full (about 1 minute
-  per 30,000 tokens); follow-ups start in seconds.
+- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
+  GPU/CPU/RAM, and **About** with the settings and addresses.
+- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
+  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
+  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
+    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
+  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
+    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
+- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
+  fastest. High is best for hard questions.
+- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
+  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
+- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
+- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
+  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
+- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
+  messages start in seconds.
 
 More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
 
 ## Something went wrong?
 
-- **My PC froze the first time Strata started.** Normal while it loads the model: wait, don't close the window.
-  Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again: it continues where
+- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
+  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
+- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
   it stopped.
-- **It's very slow and the disk light keeps blinking, or "the engine stopped unexpectedly".** Not enough free RAM:
-  close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running - look for its window.
+- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
+  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
+- **It says port 8080 is already in use.** Strata is already running. Look for its window.
 
 More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder.
+[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
+security problem? Report it privately: [SECURITY.md](SECURITY.md).
 
 ## How does it work?
 
-Models like this one normally run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes it fit by **sharing the work across your whole PC** - like a kitchen, where the things you use
-all the time stay on the counter and the rest waits in the pantry.
+Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
+12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
+you use all the time stay on the counter, and the rest waits in the pantry.
 
 <p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
 
-- **The model is a team of 24,576 small specialists ("experts"),** and each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are asked most often; **your RAM** holds all of them,
+- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
+- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
   and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
 
 <p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
 
-- **Guess, then check:** a small helper guesses the next few words and the big model checks them all at once, so
-  you get the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time): over 1,000 tokens per second.
+- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
+  the same answer, 1.6-1.8x sooner.
+- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
 
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers: [the
-details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
+[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
 
 ## Credits and license
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team, compressed by
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5) and Unsloth;
-Strata is built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE); a few
-parts and every model carry their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
+compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
+and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
+[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
+parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
 
 ## Support Strata
 

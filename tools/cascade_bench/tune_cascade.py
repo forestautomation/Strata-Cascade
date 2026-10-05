@@ -45,6 +45,36 @@ PIN_HELPER_CAP_GIB = 6.0        # measured sweet spot beside a 16 GB primary; ne
 MIN_RAM_GIB = 32.0
 MIN_VRAM_GIB = 12.0
 
+# The shipped memory-guard knobs.  The tuner writes these into every guard-on run and into the winning
+# config, so the result does not depend on whatever the engine's compiled defaults happen to be later.
+# They apply on BOTH platforms: the engine reads them on Linux too, where trim / priority / notify are
+# Windows-only and ignored (the guard there only pauses cold prefetch).  See STRATA-CASCADE.md
+# ("The memory guard") and docs/TUNING.md section 1b.
+GUARD_ENV = {
+    "STRATA_MEM_GUARD_KEEP_FREE_MIB": "1024",   # free-RAM target to hold
+    "STRATA_MEM_GUARD_RECOVER_MIB": "1024",     # release/clear this far above keep_free (must be >= the band)
+    "STRATA_MEM_GUARD_RELEASE_MIB": "256",      # smallest release once the guard acts
+    "STRATA_MEM_GUARD_PREDICT_BAND_MIB": "512", # start early this close to keep_free, on a fast decline
+    "STRATA_MEM_GUARD_MIN_MIB": "512",          # free-RAM floor that also counts as pressure
+    "STRATA_MEM_GUARD_EMERGENCY_MIB": "256",    # below this (or once the OS says low), release hard
+    "STRATA_MEM_GUARD_COMMIT_MIB": "2048",      # available-commit floor
+}
+
+
+def apply_guard_env(cfg, on):
+    """Merge the shipped guard knobs into `cfg['env']` when the guard is kept on, drop them when it is off.
+
+    Keeps every other env key (AMD GEMM tables, the user's own settings) untouched.  `cfg` is copied, so the
+    caller's dict is not mutated."""
+    out = dict(cfg)
+    env = dict(out.get("env") or {})
+    for k in GUARD_ENV:
+        env.pop(k, None)
+    if on:
+        env.update(GUARD_ENV)
+    out["env"] = env
+    return out
+
 
 def log(msg):
     print(msg, flush=True)
@@ -341,6 +371,10 @@ def one_layout(cfg, layout, python_exe, port, max_tokens, repeats, tag, i, total
 
     run_cfg = dict(cfg)
     run_cfg["args"] = eargs
+    if guard_flag is not None:
+        # Force the shipped guard knobs for this arm, so the A/B measures the shipped guard rather than
+        # whatever the engine's compiled defaults are - the same numbers on Linux and Windows.
+        run_cfg = apply_guard_env(run_cfg, bool(layout.get("guard")))
     run_log = out_dir / ("tune-%s-l%d.engine.log" % (tag, i))
     run_cfg["log"] = str(run_log)
     run_cfg_path = out_dir / ("tune-%s-l%d.json" % (tag, i))
@@ -435,7 +469,9 @@ def main():
     ap.add_argument("--tag", default="tune")
     ap.add_argument("--guard", action="store_true",
                     help="after the sweep, A/B the winning layout with the memory guard on and off, and keep "
-                         "it if it does not cost decode throughput")
+                         "it if it does not cost decode throughput. The shipped knobs (keep 1024 / "
+                         "recover 1024 / release 256 / band 512 MiB) are written into the run and the winning "
+                         "config, on Windows and Linux")
     ap.add_argument("--guard-flag", default="--memory-guard",
                     help="the engine flag the guard A/B toggles (default --memory-guard; the alias "
                          "--windows-memory-guard always works and is dropped first)")
@@ -460,6 +496,11 @@ def main():
     if "--expert-profile" not in eargs:
         log("ERROR: --tiered-experts needs --expert-profile. See docs/TUNING.md section 1.")
         return 2
+
+    # Normalize the memory-guard knobs to the shipped values whenever the base config has the guard
+    # on, so the sweep and the winning config use them too - the same numbers on Linux and Windows.
+    cfg = apply_guard_env(cfg, ("--memory-guard" in eargs) or ("--windows-memory-guard" in eargs))
+    eargs = cfg.get("args", [])
 
     out_dir = Path(args.out) if args.out else HERE
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -665,6 +706,11 @@ def main():
         win_cfg["args"] = remove_flag(win_cfg["args"], "--windows-memory-guard")
         win_cfg["args"] = (add_flag(win_cfg["args"], args.guard_flag) if guard_helps
                            else remove_flag(win_cfg["args"], args.guard_flag))
+    # Ship the guard knobs whenever the guard is on in the final config (the A/B's verdict, or the
+    # base config's own choice when --guard was not given) and drop them when it is off - so the config is
+    # self-describing and portable instead of relying on the engine's compiled defaults.
+    guard_on = (args.guard_flag in win_cfg["args"]) or ("--windows-memory-guard" in win_cfg["args"])
+    win_cfg = apply_guard_env(win_cfg, guard_on)
     win_path = out_dir / ("tune-%s-best.json" % stamp)
     win_path.write_text(json.dumps(win_cfg, indent=2), encoding="utf-8")
 
@@ -687,6 +733,10 @@ def main():
     if args.guard and guard_helps is not None:
         log("  memory guard: %s%s" % ("on" if guard_helps else "off",
             "" if guard_helps else " (the A/B measured a decode cost on this machine)"))
+        if guard_helps:
+            log("  guard knobs: keep %s / recover %s / release %s / band %s MiB  (written to the config)"
+                % (GUARD_ENV["STRATA_MEM_GUARD_KEEP_FREE_MIB"], GUARD_ENV["STRATA_MEM_GUARD_RECOVER_MIB"],
+                   GUARD_ENV["STRATA_MEM_GUARD_RELEASE_MIB"], GUARD_ENV["STRATA_MEM_GUARD_PREDICT_BAND_MIB"]))
     if any(r.get("oom") for r in rows):
         log("  note: at least one layout ran out of memory in prefill - see the CSV's oom column")
     log("  CSV   : %s" % csv_path)

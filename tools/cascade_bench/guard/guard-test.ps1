@@ -20,17 +20,21 @@ param(
   [int]$HogMB = 10240,
   [int]$HogHoldS = 120,
   [int]$GuardMinMib = 512,
-  [int]$GuardKeepFreeMib = 512,
+  [int]$GuardKeepFreeMib = 1024,
   [int]$GuardEmergencyMib = 256,
+  [int]$GuardRecoverMib = 1024,
+  [int]$GuardReleaseMib = 256,
   [int]$GuardCommitMib = 2048,
   [int]$GuardPollMs = 500,
   [int]$GuardRetrimMs = 3000,
   [int]$GuardCooldownMs = 2000,
   [string]$GuardTrim = "soft",
   [string]$GuardNotify = "1",
+  [string]$GuardPriority = "1",
   [string]$GuardPredict = "1",
   [string]$GuardPredictSlope = "128",
   [string]$GuardStats = "1",
+  [int]$SampleMs = 2000,
   [int]$MaxTokens = 5000,
   [int]$Repeats = 1,
   [int]$HogAfterS = 25,
@@ -78,12 +82,15 @@ if ($NoGuard) {
     STRATA_MEM_GUARD_MIN_MIB         = "$GuardMinMib"
     STRATA_MEM_GUARD_KEEP_FREE_MIB   = "$GuardKeepFreeMib"
     STRATA_MEM_GUARD_EMERGENCY_MIB   = "$GuardEmergencyMib"
+    STRATA_MEM_GUARD_RECOVER_MIB     = "$GuardRecoverMib"
+    STRATA_MEM_GUARD_RELEASE_MIB     = "$GuardReleaseMib"
     STRATA_MEM_GUARD_COMMIT_MIB      = "$GuardCommitMib"
     STRATA_MEM_GUARD_POLL_MS         = "$GuardPollMs"
     STRATA_MEM_GUARD_RETRIM_MS       = "$GuardRetrimMs"
     STRATA_MEM_GUARD_COOLDOWN_MS     = "$GuardCooldownMs"
     STRATA_MEM_GUARD_TRIM            = "$GuardTrim"
     STRATA_MEM_GUARD_NOTIFY          = "$GuardNotify"
+    STRATA_MEM_GUARD_PRIORITY        = "$GuardPriority"
     STRATA_MEM_GUARD_PREDICT         = "$GuardPredict"
     STRATA_MEM_GUARD_PREDICT_SLOPE   = "$GuardPredictSlope"
     STRATA_MEM_GUARD_STATS           = "$GuardStats"
@@ -135,7 +142,7 @@ if (-not $NoHog) {
     -WorkingDirectory $root -PassThru -WindowStyle Hidden
 }
 
-"t_s,avail_mib,strata_ws_mib,strata_private_mib,strata_cpu_s,page_in_total,page_out_total,pagefile_mb,pagefile_peak_mb,gpu_util,hog_alive" | Set-Content $samples
+"t_s,avail_mib,strata_ws_mib,strata_private_mib,strata_pf_mib,strata_faults,strata_cpu_s,page_in_total,page_out_total,pagefile_mb,pagefile_peak_mb,gpu_util,hog_alive" | Set-Content $samples
 $t0 = Get-Date
 while (-not $bench.HasExited -and ((Get-Date) - $t0).TotalMinutes -lt 40) {
   $avail = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024, 0)
@@ -143,6 +150,13 @@ while (-not $bench.HasExited -and ((Get-Date) - $t0).TotalMinutes -lt 40) {
   $ws = if ($p) { [math]::Round($p.WorkingSet64 / 1MB, 0) } else { -1 }
   $priv = if ($p) { [math]::Round($p.PrivateMemorySize64 / 1MB, 0) } else { -1 }
   $cpu = if ($p) { [math]::Round($p.CPU, 1) } else { -1 }
+  # Per-process page-file volume and cumulative hard-fault count: the guard's job is to keep the engine's
+  # PageFileUsage flat (it moves clean pages to standby, not to disk).  Win32_Process reports KB / a count.
+  $spf = -1; $faults = -1
+  try {
+    $wp = Get-CimInstance Win32_Process -Filter "Name='strata.exe'" -ErrorAction Stop | Select-Object -First 1
+    if ($wp) { $spf = [math]::Round($wp.PageFileUsage / 1024, 0); $faults = [double]$wp.PageFaults }
+  } catch { }
   # Cumulative system page counts (raw perf counters); the delta over the run is the real page-file volume.
   $pin = -1; $pout = -1
   try {
@@ -160,9 +174,9 @@ while (-not $bench.HasExited -and ((Get-Date) - $t0).TotalMinutes -lt 40) {
   try { $gpu = (& nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>$null) -join "/" } catch { }
   $hogAlive = if ($hog) { -not $hog.HasExited } else { $false }
   $t = [math]::Round(((Get-Date) - $t0).TotalSeconds, 0)
-  "$t,$avail,$ws,$priv,$cpu,$pin,$pout,$pfmb,$pfpeak,$gpu,$hogAlive" | Add-Content $samples
-  Write-Host "t=$t s avail=$avail MiB strataWS=$ws MiB cpu=$cpu s pf=$pfmb MB peak=$pfpeak MB gpu=$gpu hog=$hogAlive"
-  Start-Sleep -Seconds 3
+  "$t,$avail,$ws,$priv,$spf,$faults,$cpu,$pin,$pout,$pfmb,$pfpeak,$gpu,$hogAlive" | Add-Content $samples
+  Write-Host "t=$t s avail=$avail MiB strataWS=$ws MiB strataPF=$spf MiB faults=$faults cpu=$cpu s pf=$pfmb MB peak=$pfpeak MB gpu=$gpu hog=$hogAlive"
+  Start-Sleep -Milliseconds $SampleMs
 }
 if ($hog -and -not $hog.HasExited) { Stop-Process -Id $hog.Id -Force -ErrorAction SilentlyContinue }
 $bench.WaitForExit()

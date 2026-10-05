@@ -34,6 +34,14 @@ if (Test-Path $samples) {
     $ws = Stats ($s.strata_ws_mib | ForEach-Object { [double]$_ } | Where-Object { $_ -ge 0 })
     Write-Host ("samples={0}  avail MiB min/avg/max = {1:N0}/{2:N0}/{3:N0}   strata WS MiB min/avg/max = {4:N0}/{5:N0}/{6:N0}" -f `
       $s.Count, $av.Minimum, $av.Average, $av.Maximum, $ws.Minimum, $ws.Average, $ws.Maximum)
+    if ($cols -contains "strata_pf_mib") {
+      $spf = Stats ($s.strata_pf_mib | ForEach-Object { [double]$_ } | Where-Object { $_ -ge 0 })
+      Write-Host ("engine pagefile MiB min/avg/max = {0:N0}/{1:N0}/{2:N0}" -f $spf.Minimum, $spf.Average, $spf.Maximum)
+    }
+    if ($cols -contains "strata_faults") {
+      $f = @($s.strata_faults | ForEach-Object { [double]$_ } | Where-Object { $_ -ge 0 })
+      if ($f.Count -ge 2) { Write-Host ("engine hard faults over run = {0:N0}" -f ($f[-1] - $f[0])) }
+    }
     # Cumulative page counters: the first->last delta is the page-file volume moved over the run.
     # When the hog was active, also report the delta from the first hog-active sample, so an overflow
     # A/B compares the same window (the load phase differs between arms).

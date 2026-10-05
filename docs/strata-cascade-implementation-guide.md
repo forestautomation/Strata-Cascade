@@ -5,7 +5,7 @@ expert-source files often, so the port has to be re-landed regularly. This file 
 the changes are and where they go*; `STRATA-CASCADE.md` is the *results* document and `docs/TUNING.md` is the
 *how to tune it* document.
 
-**Target of the current port.** Upstream `origin/main` (`db4f91a`, v0.1.38) -> branch `cascade` in `<repo>` - the
+**Target of the current port.** Upstream `origin/main` (`6f32ec0`, v0.1.39) -> branch `cascade` in `<repo>` - the
 port re-applied as a single commit on the new upstream.
 
 This fork's own additions are the Windows implementation; the `also_vram` mask that lets the pinned RAM tier run
@@ -16,7 +16,7 @@ upstream [PR #80](https://github.com/Niko1221/Strata/pull/80) by @andrewcoul (cl
 the tier into `FileExpertSource`), with parts rewritten so it works on Windows.
 
 **Canonical artifacts kept for re-ports:**
-- This repo on branch `cascade` - the port applied as one commit on top of upstream 0.1.38. Every artifact below
+- This repo on branch `cascade` - the port applied as one commit on top of upstream 0.1.39. Every artifact below
   is recoverable from it alone.
 - Archive of the original 0.1.30 port as patches: `<port-patches>\0001..0004-*.patch` (outside the repo).
 - The big new file `src/core/tiered_source.cpp` (~1044 lines, verbatim) is NOT reproduced here. Recover it with:
@@ -170,7 +170,7 @@ Phase C corrects upstream's adaptive tier (`--adapt-every` / `--adapt-swaps`) fo
 | allow COLD swap sources by default | `STRATA_ADAPT_NOCOLD=1` opts out | excluded cold -> hit capped at 66% |
 | keep the pinned copy on promote | `TieredExpertSource::promote_to_vram` -> `retained_pins()` | `demoted()` dropped the pin -> SSD re-read |
 
-Measured effect: 41.9 -> 50.1 t/s, hit 58.5% -> 87.6% (current run).
+Measured effect: 41.9 -> 50.5 t/s, hit 58.5% -> 87.6% (current run).
 
 ---
 

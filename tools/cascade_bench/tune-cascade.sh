@@ -10,6 +10,8 @@
 #   tools/cascade_bench/tune-cascade.sh --config strata-<model>.json
 #   tools/cascade_bench/tune-cascade.sh --config <path> --port 8080 --repeats 2
 #   tools/cascade_bench/tune-cascade.sh --guard    # A/B the memory guard on the winning layout
+# --guard writes the shipped guard knobs (keep 1024 / recover 1024 / release 256 / band 512 MiB)
+# into the run and the winning config.
 #
 # --config is the config setup wrote (strata-<model>.json in the repo root).
 # See docs/TUNING.md. The bench prompt overfits - confirm the winner on your real workload.

@@ -1,7 +1,7 @@
 # Strata-Cascade: what it is, what it measured
 
-**Build this documents:** upstream Strata **v0.1.38** plus the cascade port - branch `cascade`, re-landed as one commit
-on `origin/main` (`db4f91a`). Updated 2026-10-03. The numbers are from a **fresh build of this port**, measured against
+**Build this documents:** upstream Strata **v0.1.39** plus the cascade port - branch `cascade`, re-landed as one commit
+on `origin/main` (`6f32ec0`). The numbers are from a **fresh build of this port**, measured against
 a **fresh build of the same base with no port** (a throwaway stock worktree), one run each at 128K - the same
 base on both sides, so the comparisons isolate the fork. Everything not described here is upstream's.
 
@@ -25,29 +25,31 @@ works on Windows.
 ## Cascade vs stock upstream on the same PC
 
 Measured against a **stock upstream build** on the same machine, same model and settings. Both arms were rebuilt
-from the same base the day of the run: the cascade from this branch, the stock engine from `origin/main` (`db4f91a`)
+from the same base the day of the run: the cascade from this branch, the stock engine from `origin/main` (`6f32ec0`)
 with no port, in a throwaway worktree. Every arm: **Qwen3.8-Flash-Next IQ3_XXS, 32K-token prompt
 / 5K reply at 128K context, `--kv int8 --kv-resident 20480`**, vision on, `--spec 4 --spec-min-p
 0.5`, both cards. One run each.
 
 | Arm | Config | Decode | Prefill | Cache hit |
 | --- | --- | ---: | ---: | ---: |
-| **A. Upstream, dual-GPU (2 GPU, current)** | `--mmap-experts --expert-cache-device1 6250` (db4f91a) | 37.9 t/s | 245.0 t/s | 54.9% |
-| **B. Cascade, 2 cards (current)** | `--tiered-experts --host-budget-gib 6 --expert-cache-device1 6250 --adapt-every 8` | **50.1 t/s** | **844.5 t/s** | **87.6%** |
-| **C. Upstream, low-RAM (1 GPU, historical)** | `--resident-experts`, warm OS file cache | 29.7 t/s | 434 t/s | 35% |
-| **D. Cascade, 1 card (historical)** | `--tiered-experts --host-budget-gib 8 --adapt-every 0` | 28.2 t/s | ~960 t/s | 38% |
+| **A. Upstream, dual-GPU (2 GPU, current)** | `--mmap-experts --remote-expert-opt --expert-cache-device1 6250` (6f32ec0) | 42.5 t/s | 252.9 t/s | 87.4% |
+| **B. Cascade, 2 cards (current)** | `--tiered-experts --host-budget-gib 6 --expert-cache-device1 6250 --adapt-every 8 --memory-guard` | **51.8 t/s** | **900.5 t/s** | 86.2% |
+| **C. Upstream, low-RAM (1 GPU)** | `--resident-experts`, warm OS file cache | 29.7 t/s | 434 t/s | 35% |
+| **D. Cascade, 1 card** | `--tiered-experts --host-budget-gib 8 --adapt-every 0` | 28.2 t/s | ~960 t/s | 38% |
 
-**The current two-card cascade is 1.3x the current stock dual-GPU decode and 3.4x its prefill**, with an 87.6% vs
-54.9% cache hit rate. That is the fresh, same-base comparison (A vs B); the 1.7x/1.9x figures against the older
-one-card stock runs (C, warm) are kept below for context. The gaps are far larger than run-to-run noise (+/-5%).
+**The current two-card cascade is 1.2x the current stock dual-GPU decode and 3.6x its prefill**, with a cache hit
+rate on par with stock (86.2% vs 87.4%). That is the fresh, same-base comparison (A vs B). The gaps are far larger than
+run-to-run noise (+/-5%). The stock arm uses upstream's `--remote-expert-opt` (87.4% hit); the cascade arm does not use
+it (with it the cascade measured 47.7 t/s decode / 892.7 t/s prefill / 89.9% hit).
 
 **Why**, from the engine logs of each arm:
 
 - **A (stock, dual-GPU)** uses both cards but **upstream forbids a RAM tier beside a helper** (`generate.cpp`), so
-  every miss is a synchronous file read: the engine read **1,279,108 MB** in one request, and prefill stays at
-  245 t/s. It ran with ~61 MiB of free RAM (average 281 MiB) and read **151 GB** from the page file over the run.
+  every miss is a synchronous file read: prefill stays at 253 t/s. (On the earlier same-base run it read
+  **1,279,108 MB** in one request, sat at ~61 MiB of free RAM, average 281 MiB, and read **151 GB** from the page
+  file over the run.)
 - **B (cascade, current)** is the only arm with **VRAM, pinned RAM, the CUDA1 helper and SSD streaming together**:
-  tiers `VRAM 10662 | PINNED 3656 (6.00 GiB) | COLD 10258 (16.68 GiB)`, cold reads **97% prefetched**, 87.6% hit.
+  tiers `VRAM 10783 | PINNED 3674 (5.99 GiB) | COLD 10119 (16.49 GiB)`, cold reads **94% prefetched**, 87.6% hit.
   Because its RAM budget is **pinned** rather than page-cache-dependent, it holds its speed at 128K context. The
   `--windows-memory-guard` is opt-in on top of this (measured separately below): with it the engine wrote **1,002
   MiB** to the page file over the run vs the stock arm's 1,425 MiB, and kept usable RAM (min 303 MiB / avg 7,961 MiB
@@ -143,11 +145,13 @@ comparison against stock upstream**; this table isolates what the *adaptive tier
 | Config | Decode | Expert-cache hit | Notes |
 | --- | ---: | ---: | --- |
 | Cascade, adaptive off (`--adapt-every 0`) | 43.2 t/s | 58.5% | tiering alone is throughput-neutral; it is what makes it *fit* (earlier run) |
-| **Cascade + adaptive tier** (`--adapt-every 8 --adapt-swaps 32`) | **50.1 t/s** | **87.6%** | the current measured config |
+| **Cascade + adaptive tier** (`--adapt-every 8 --adapt-swaps 32`) | **50.5 t/s** | **87.6%** | the current measured config |
 | Cascade, old adaptive path (before Phase C) | 41.9 t/s | - | the adaptive swap stole the helper's pairs |
 
-Prefill on the same run: **844 t/s** (32K prompt). The adaptive tier is upstream's own Plan v0.3 P6 machinery;
+Prefill on the same run: **867 t/s** (32K prompt). The adaptive tier is upstream's own Plan v0.3 P6 machinery;
 **Phase C** changed *which* experts it is allowed to promote (see section 3), which is where the gain comes from.
+The headline's current best (51.8 / 900.5) is this config **plus `--memory-guard`** (see **The memory guard**
+below).
 
 > The "43.2 t/s / 58.5%" figure is *cascade with the adaptive tier off* - not the stock engine. **The headline
 > carries the true stock numbers** (the separate upstream build, arm A).
@@ -213,7 +217,7 @@ A short sweep on this rig settled the two budgets that matter, at **131072 conte
 | Cards | Pinned | Helper | Adaptive | Decode | Prefill | Hit | Outcome |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
 | 2 | 4 GiB | 6250 | on | 49.1 t/s | 849 t/s | 84.8% | the earlier sweep's winning layout |
-| 2 | 6 GiB | 6250 | on | **50.1 t/s** | **844.5 t/s** | **87.6%** | **fastest here - the config above (current run)** |
+| 2 | 6 GiB | 6250 | on | **51.8 t/s** | **900.5 t/s** | 86.2% | **fastest here - the config above (current run, + `--memory-guard`)** |
 | 2 | 8 GiB | 6250 | on | - | - | - | **fails at start**: the pin exhausts the driver's page-lock capacity; CUDA0's cache/buffers cannot allocate |
 | 1 | 8 GiB | - | off | 28.2 t/s | ~960 t/s | 38% | best one-card config (`--low-ram tiered`) |
 
@@ -239,11 +243,11 @@ tuner's `oom_reason()` / `pin_clamped()` treat a refused pin or an under-reached
 ```
 strata generate: experts via the tiered source (mapped ...\experts.bin); tiers are set after the cache fill
 strata generate: expert cache auto: 9.61 GiB free, 1000 MiB reserved (+73 MiB for the draft head) -> 3945 slots
-strata generate: PCIe probe: 14.5 GB/s host->device (best of 14.4 14.5 14.4 14.4) -> pcie_frac 0.40 (default 0.55)
+strata generate: PCIe probe: 14.5 GB/s host->device (best of 14.5 14.5 14.4 14.5) -> pcie_frac 0.40 (default 0.55)
 strata generate: CUDA1: 6250 additional experts, 10.12 GiB; results return through pinned host rows
-strata generate: tiers: VRAM 10662 experts (17.29 GiB, 6250 held by another GPU, left to the standby list) | PINNED 3656 (6.00 GiB, 6 runs, 6.00 GiB locked) | COLD 10258 (16.68 GiB, paged from SSD) | budget 6.00 GiB | 2.0 s
-strata serve: tiered decode misses: PINNED 68512 (RAM), COLD 113497 (SSD, 195783.0 MB, 109766 prefetched = 97%)
-strata serve: decode expert cache hit rate: 87.6% (1719737 hits / 1963800 lookups)
+strata generate: tiers: VRAM 10783 experts (17.48 GiB, 6250 held by another GPU, left to the standby list) | PINNED 3674 (5.99 GiB, 6 runs, 6.00 GiB locked) | COLD 10119 (16.49 GiB, paged from SSD) | budget 6.00 GiB | 3.9 s
+strata serve: tiered decode misses: PINNED 67711 (RAM), COLD 108925 (SSD, 189306.2 MB, 102313 prefetched = 94%)
+strata serve: decode expert cache hit rate: 87.6% (1710040 hits / 1952011 lookups)
 ```
 
 These are the engine's own startup lines from the current Cascade arm (the `tiers:` line is the one to check). The
@@ -262,13 +266,15 @@ own footprint is **clean, file-backed** memory (the mapped experts, the mapped w
 page-file write and re-read from the model's SSD on demand. `--memory-guard` (alias `--windows-memory-guard`) lets
 RAM fill, then makes the **engine** the cheapest victim instead of paging *your* apps out.
 
-**Windows** does the full yield: it watches the OS's own low/high memory notifications, a free-RAM target
-(`STRATA_MEM_GUARD_KEEP_FREE_MIB`, default 512) and a predictive decline trend; on pressure it lowers the engine's
-memory priority, pauses cold prefetch and releases its cheap pages - a proportional `soft` working-set ceiling by
-default, or a `hard` `EmptyWorkingSet`. **On Linux the same flag is implemented but only pauses cold prefetch** (the
-per-process memory priority and the working-set ceiling have no Linux equivalent, and the kernel already reclaims the
-clean expert pages itself). The Linux path is **unmeasured**. Knobs and the harness: [`docs/TUNING.md`](docs/TUNING.md)
-section 1b.
+**Windows** does the full yield: it watches a free-RAM target (`STRATA_MEM_GUARD_KEEP_FREE_MIB`, default 1024), the
+OS's own low/high memory notifications, and a predictive decline trend. On pressure it lowers the engine's memory
+priority and pauses cold prefetch, and it releases the deficit with a proportional `soft` working-set ceiling (set to
+`entry_ws - deficit`); it **holds** `VERY_LOW` priority for the whole low period so the OS keeps choosing the engine's
+clean, file-backed pages over another app's dirty ones. `hard` (`EmptyWorkingSet`) and `off` remain. Windows has no
+per-range drop to call: `OfferVirtualMemory` is rejected for file mappings and, where it works, discards contents and
+blocks access until `ReclaimVirtualMemory` - the original comment in `tiered_source.cpp` was right. **On Linux the same
+flag pauses cold prefetch** (the kernel already reclaims the clean expert pages); the Linux path is **unmeasured**.
+Knobs and the harness: [`docs/TUNING.md`](docs/TUNING.md) section 1b.
 
 Measured on Windows 11, 32 GB RAM, RTX 5060 Ti + a helper card, IQ3_XXS, `--tiered-experts --host-budget-gib 4`,
 32K prefill / 5K decode, one run each. This PC runs so close to full that the guard acts even in a *normal* run:
@@ -279,9 +285,9 @@ Measured on Windows 11, 32 GB RAM, RTX 5060 Ti + a helper card, IQ3_XXS, `--tier
 | `soft` (default) | 810.4-834.0 | 45.3-49.4 | 0-3k/s | 2-14 soft, 0-1 hard |
 | `hard` | 816.0 | 47.1 | 0 | 5 hard |
 
-The same effect in a straight **cascade + guard vs stock** pair (Windows 11, 32 GB, IQ3_XXS, 32K/5K, one run each;
-stock = a port-free `origin/main` build with `--mmap-experts` + the CUDA1 helper, which does not accept the guard
-flag, so it is the "no guard" arm):
+The same effect in a straight **cascade + guard vs stock** pair, measured on the earlier same-base run (Windows 11,
+32 GB, IQ3_XXS, 32K/5K, one run each; stock = a port-free `origin/main` build with `--mmap-experts` + the CUDA1
+helper, which does not accept the guard flag, so it is the "no guard" arm):
 
 | | cascade + guard | stock (no guard) |
 | --- | --- | --- |
@@ -308,13 +314,12 @@ it; moving the page file to an SSD is still the real fix.
   cells/layer kept in VRAM; the rest streams from pinned RAM) and vision on. Only this bench is quoted. The context
   and KV quant matter: they set how much VRAM is left for experts and how much pinned RAM the KV costs, which is
   exactly what the cascade and the stock low-RAM mode are competing for on a 32 GB PC.
-- **The stock arm** (headline A): a clean upstream `origin/main` (`db4f91a`) build, no port, in a throwaway
+- **The stock arm** (headline A): a clean upstream `origin/main` (`6f32ec0`) build, no port, in a throwaway
   worktree. It is upstream's best dual-GPU attempt (`--mmap-experts` + the
-  CUDA1 helper - upstream refuses a RAM tier with it). The older one-card stock runs (C) are kept for context only.
-- **The comparison is same-base:** the cascade and the stock engine are both built from `db4f91a`, so the headline
-  isolates the port and its configuration, not a version difference. The cascade arm (B) is the latest run; the stock
-  arm (A) is the same-base baseline measured alongside the earlier cascade run (the two agree with it within +/-5%).
-- **Run count:** each arm is a single run. The headline gaps (50.1 vs 37.9 decode, 844 vs 245 prefill) are far larger
+  CUDA1 helper - upstream refuses a RAM tier with it).
+- **The comparison is same-base:** the cascade and the stock engine are both built from `6f32ec0`, so the headline
+  isolates the port and its configuration, not a version difference.
+- **Run count:** each arm is a single run. The headline gaps (51.8 vs 42.5 decode, 900 vs 253 prefill) are far larger
   than the +/-5% run-to-run spread.
 - **Do not overfit.** The bench prompt is one code block repeated many times, so its routing is unusually regular;
   numbers tuned on it can mislead on a real workload. Final tuning should use what you actually run - see

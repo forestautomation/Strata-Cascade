@@ -32,6 +32,17 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
+/// #357/#577: whether the OS file cache could keep the `read_bytes` the expert files are read for, beside
+/// `arena_bytes` of RAM held by the engine's own copy of the experts and `margin` for everything else, with `avail`
+/// bytes of RAM available.  The file tier passes only the expert bytes it really reads from the files (the experts
+/// outside its resident RAM copy) and the RAM that copy really holds - not every shard's bytes and the requested
+/// budget, which on a 96 GB PC (#577) made the file tier read unbuffered when the cache could keep its reads.
+inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read_bytes,
+                             uint64_t margin = 4ull << 30) {
+    const uint64_t room = avail > arena_bytes + margin ? avail - arena_bytes - margin : 0;
+    return room >= read_bytes;
+}
+
 // ---- the memory-pressure guard (opt-in; see --memory-guard) -------------------------------------
 //
 // When the page file is on a slow disk, a PC that is short on RAM freezes while the OS pages: the
@@ -67,10 +78,11 @@ enum class MemGuardTrim {
 struct MemoryGuardConfig {
     int poll_ms = 500;                ///< how often to sample
     uint64_t min_avail_mib = 512;     ///< fallback floor: pressure while free physical memory is under this
-    uint64_t keep_free_mib = 512;     ///< the free-RAM target the soft ceiling holds; pressure under it
+    uint64_t keep_free_mib = 1024;    ///< the free-RAM target the guard holds; pressure under it
     uint64_t min_commit_mib = 2048;   ///< ... or available commit (RAM + page file) is under this
     uint64_t emergency_mib = 256;     ///< below this (or once the OS signals low), release hard even in soft mode
-    uint64_t recover_mib = 512;       ///< pressure clears this far above both floors (hysteresis)
+    uint64_t recover_mib = 1024;      ///< release toward (and clear) this far above `keep_free_mib` (hysteresis)
+    uint64_t release_min_mib = 256;   ///< smallest release once the guard acts (keeps a release meaningful)
     int retrim_ms = 3000;             ///< while pressure lasts, act again this often (0 = only on entry)
     int cooldown_ms = 2000;           ///< after recovery, ignore soft pressure this long (emergency still acts)
     MemGuardTrim trim = MemGuardTrim::Soft;  ///< Windows-only trim mode; see MemGuardTrim (ignored on Linux)
@@ -109,5 +121,26 @@ void memory_guard_stop();
 bool memory_pressure_low();
 /// Snapshot of the guard thread's work so far (all zero when the guard is off or off-Windows).
 MemoryGuardStats memory_guard_stats();
+
+/// What the guard should do this poll, from the samples and the previous state.  Pure, so the state
+/// machine can be unit-tested without a GPU or a memory hog (see `memory_test.cpp`).
+enum class GuardAction {
+    None,     ///< idle: no pressure, no action
+    Enter,    ///< pressure began: start acting and hold
+    Stay,     ///< already acting: release the remaining deficit (or an emergency release)
+    Recover,  ///< pressure cleared: resume and start the cooldown
+};
+
+struct GuardDecision {
+    GuardAction action = GuardAction::None;
+    uint64_t release_mib = 0;   ///< bytes (MiB) to release on Enter/Stay
+    bool emergency = false;     ///< a genuine cliff: release hard even in soft mode
+};
+
+/// `avail_mib`/`commit_mib` are 0 when the sample is unavailable; `os_low` is the OS's own low-memory
+/// notification (always false off-Windows); `in_cooldown` suppresses a new Enter; `slope_mib_s` is the
+/// EWMA free-RAM decline (positive = falling).
+GuardDecision memory_guard_decide(const MemoryGuardConfig& cfg, bool low, uint64_t avail_mib,
+                                  uint64_t commit_mib, bool os_low, bool in_cooldown, double slope_mib_s);
 
 }  // namespace strata::platform

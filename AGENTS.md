@@ -10,7 +10,8 @@ one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 Everything here is **upstream Strata** plus multiple additions, built around the **cascading expert source** (`--tiered-experts`),
 which sorts the experts across VRAM, a pinned RAM budget and the SSD so a PC whose RAM cannot hold every expert
 still runs the model, and combines that with the CUDA1..3 helper (a combination upstream rejects). The port lives
-on branch `cascade` as a single commit on top of upstream.
+on branch `cascade` as a single commit on top of the fork's `main` (`forestautomation/Strata-Cascade`): each new
+upstream release is merged into the port and the whole thing re-squashed onto the fork's `main`.
 
 - **Do not "fix" the cascade away.** Upstream's own `--resident-cpu-experts` is not a replacement: it hard-rejects
   the helper. The port is the point of this fork.
@@ -28,7 +29,8 @@ on branch `cascade` as a single commit on top of upstream.
   [`docs/TUNING.md`](docs/TUNING.md) section 1b; the test harness in `tools/cascade_bench/guard/` (`guard-test.ps1`,
   `mem-hog.py`, `guard-summary.ps1`). Off by default. On Windows it trims the working set + lowers memory priority;
   on Linux it only pauses cold prefetch (implemented, unmeasured); the harness is Windows-only.
-- Re-landing on a new upstream: **rebase** the port commit on `origin/main` (not merge) so conflicts stay isolated.
+- Re-landing on a new upstream: merge `origin/main` into the port, then squash the port back onto the fork's `main`
+  as one commit (the fork's `main` stays an ancestor, so the update fast-forwards).
 
 ## Installing Strata for a user
 

@@ -280,9 +280,11 @@ bool TieredExpertSource::settle(const ExpertCache* cache, const uint8_t* also_vr
     const auto t0 = std::chrono::steady_clock::now();
     other_vram_.assign((size_t) (n_layers_ * n_expert_), 0);
 
-    // ---- 1. the VRAM tier.  Windows has no per-range "drop these clean mapped pages" call; a mapping's faulted
-    // pages sit on the standby list and are reclaimed before anonymous memory, so the drop is best-effort and
-    // gated behind STRATA_TRIM_WORKING_SET (SetProcessWorkingSetSize trims the whole process).
+    // ---- 1. the VRAM tier.  Windows has no per-range "drop these clean mapped pages" call (`OfferVirtualMemory`
+    // is not it: it can discard contents and the range is inaccessible until `ReclaimVirtualMemory`, and it
+    // rejects file mappings).  A mapping's faulted pages sit on the standby list and are reclaimed before
+    // anonymous memory, so the drop is best-effort and gated behind STRATA_TRIM_WORKING_SET
+    // (SetProcessWorkingSetSize trims the whole process).
     //
     // `cache` is the primary tier and `also_vram` every other VRAM tier (a layer-split stage, a CUDA1..3 helper).
     // Both are VRAM: the point of the mask is that the PINNED loop below must not spend the budget on a blob a GPU

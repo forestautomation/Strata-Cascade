@@ -63,25 +63,36 @@ knobs and how to test it.
 
 `--memory-guard` (alias `--windows-memory-guard`; env `STRATA_MEMORY_GUARD`, alias `STRATA_WINDOWS_MEMORY_GUARD`) is
 opt-in. On Windows it lowers the engine's memory priority, pauses cold prefetch and releases its cheap pages while RAM
-is short. On Linux it **only pauses cold prefetch** (there is no per-process memory priority or working-set ceiling,
-and the kernel already reclaims the engine's clean expert pages) and it is **unmeasured**. Three release modes on
-Windows, `STRATA_MEM_GUARD_TRIM`: `soft` (default, a proportional working-set ceiling), `hard` (`EmptyWorkingSet` at
-every trigger) or `off` (priority + prefetch pause only). The engine's locked footprint (registered experts plus
-pinned host KV) cannot be trimmed, so the ceiling never goes below it.
+is short. The release is **proportional to the deficit**: the soft working-set ceiling is set to `entry_ws - deficit`,
+where the deficit is what is missing to reach `keep_free + recover`, so the guard asks for exactly what it needs
+rather than a flat fraction of the target. It **holds** `VERY_LOW` memory priority for the whole low period, so the OS
+keeps choosing the engine's clean, file-backed COLD pages over another app's dirty ones. Three release modes on
+Windows, `STRATA_MEM_GUARD_TRIM`: `soft` (default), `hard` (`EmptyWorkingSet` at every trigger) or `off` (priority +
+prefetch pause only). The engine's locked footprint (registered experts plus pinned host KV) cannot be trimmed.
+
+> **No per-range drop on Windows.** `OfferVirtualMemory` looks like `madvise(MADV_DONTNEED)` but is not: it is rejected
+> for file mappings (`ERROR_INVALID_PARAMETER`) and, where it does work, it makes the range inaccessible until
+> `ReclaimVirtualMemory` and may discard the contents - unsafe for expert weights. So Windows releases with the
+> working-set mechanism above, not a per-range drop.
 
 The knobs:
 
-- `STRATA_MEM_GUARD_KEEP_FREE_MIB` (512) - the free-RAM target to hold; small = maximum utilization, large = a burst
-  is absorbed smoothly.
-- `STRATA_MEM_GUARD_MIN_MIB` (512) - the free-RAM floor that also counts as pressure.
+- `STRATA_MEM_GUARD_KEEP_FREE_MIB` (1024) - the free-RAM target the guard holds; the release lifts free RAM to
+  `keep + recover` and then stops. Raise it to keep more RAM free for other apps.
+- `STRATA_MEM_GUARD_RECOVER_MIB` (1024) - how far above `keep_free` the release aims, and where the guard clears.
+  It must be at least the predictive band, or the guard would enter and immediately recover.
+- `STRATA_MEM_GUARD_RELEASE_MIB` (256) - the smallest single release once the guard acts.
+- `STRATA_MEM_GUARD_MIN_MIB` (512) - the fallback free-RAM floor that also counts as pressure.
 - `STRATA_MEM_GUARD_EMERGENCY_MIB` (256) - the cliff floor; a genuine cliff releases hard even in `soft` mode.
 - `STRATA_MEM_GUARD_COMMIT_MIB` (2048) - the available-commit floor.
 - `STRATA_MEM_GUARD_POLL_MS` (500) - the sample interval.
 - `STRATA_MEM_GUARD_RETRIM_MS` (3000) - the hard re-trim rate.
 - `STRATA_MEM_GUARD_COOLDOWN_MS` (2000) - the settle time after a recovery.
-- `STRATA_MEM_GUARD_PREDICT=0` / `STRATA_MEM_GUARD_PREDICT_SLOPE` (128 MiB/s) - the fast-decline trigger.
-- Toggles: `STRATA_MEM_GUARD_PRIORITY=0`, `STRATA_MEM_GUARD_NOTIFY=0` (Windows), `STRATA_MEM_GUARD_VERBOSE=1`,
-  `STRATA_MEM_GUARD_STATS=1`.
+- `STRATA_MEM_GUARD_PREDICT_SLOPE` (128 MiB/s) / `STRATA_MEM_GUARD_PREDICT_BAND_MIB` (512) - the early trigger: a
+  free-RAM decline this fast within the band starts the release, and the band is deliberately narrow so the entry sits
+  just above `keep_free`, not 2 GiB above it.
+- Toggles: `STRATA_MEM_GUARD_PREDICT=0`, `STRATA_MEM_GUARD_PRIORITY=0`, `STRATA_MEM_GUARD_NOTIFY=0` (Windows),
+  `STRATA_MEM_GUARD_VERBOSE=1`, `STRATA_MEM_GUARD_STATS=1`.
 
 Test it with `tools/cascade_bench/guard/` (Windows-only harness) - `guard-test.ps1` runs the engine with the guard
 (and a synthetic hog) and samples free RAM, working set, paging and GPU; `guard-summary.ps1` summarizes a run. See
@@ -152,13 +163,17 @@ What it does, in order:
 5. with `--guard` (wrappers: `-Guard` / `--guard`), re-runs the **winning layout** once with `--memory-guard` and
    once without, prints the decode / prefill delta, and keeps the flag in the winning config only if it does not
    cost throughput - the guard step for the responsive-system option (see section 1b); the two rows land in the CSV
-   with `memory_guard` 1 and 0;
+   with `memory_guard` 1 and 0. Both arms run the shipped knobs (keep 1024 / recover 1024 / release 256 /
+   band 512 MiB) through the config's `env`, and those knobs are written into the winning config when the guard is
+   kept - the same on Linux and Windows (the Linux guard only pauses cold prefetch, so a near-zero delta is
+   expected);
 6. writes `tools/cascade_bench/tune-<date>.csv` and prints the winning layout.
 
 **What it changes, and what it leaves alone.** Each layout starts from your existing `strata-<model>.json` and
 overwrites **only** `--host-budget-gib`, `--host-reserve-gib`, `--vram-reserve-mib` and the helper sizes
 (`--expert-cache-device1..3`), plus `--adapt-every`/`--adapt-swaps` (8/32 with a helper, 0/0 without). The memory guard
-is only touched with `--guard`/`-Guard`. **Everything else is kept as-is** - the model, `--max-context`, the KV quant
+is only touched with `--guard`/`-Guard`, which also writes the shipped `STRATA_MEM_GUARD_*` knobs into the config's
+`env` (and drops them when the A/B chose no guard). **Everything else is kept as-is** - the model, `--max-context`, the KV quant
 and `--kv-resident` (setup's own KV-streaming decision), speculation, vision, the expert profile, host/port and any
 other flag. So the tuner assumes an otherwise valid
 `--tiered-experts` config and optimizes the tier layout on top of it; it does not fix or validate the rest.

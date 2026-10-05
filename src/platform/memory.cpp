@@ -293,12 +293,6 @@ void clear_soft_ceiling(SoftCeiling& sc) {
 
 void guard_loop(GuardState* s) {
     const MemoryGuardConfig& cfg = s->cfg;
-    const uint64_t keep_free = cfg.keep_free_mib << 20;
-    const uint64_t min_avail = cfg.min_avail_mib << 20;
-    const uint64_t min_commit = cfg.min_commit_mib << 20;
-    const uint64_t emergency = cfg.emergency_mib << 20;
-    const uint64_t recover = cfg.recover_mib << 20;
-    const uint64_t band = cfg.predict_band_mib << 20;
     const bool retrim = cfg.retrim_ms > 0;
 
     // The OS's own low/high memory notifications: the low handle is signalled while the memory manager
@@ -410,102 +404,68 @@ void guard_loop(GuardState* s) {
         }
         if (have_ms) { prev_avail = avail; prev_t = t; have_prev = true; }
 
-        const bool falling_fast = cfg.predictive && have_prev && slope >= cfg.predict_slope_mib_s &&
-                                  avail <= keep_free + band;
-        const bool pressure_now = have_ms && (avail < min_avail || avail < keep_free || commit < min_commit ||
-                                              notify_low || falling_fast);
-        // The emergency hard release is only for a genuine cliff: free RAM under the emergency floor AND
-        // the OS agrees memory is low.  A machine that idles near its floor in steady state stays soft.
-        const bool emergency_now = have_ms && (notify_low && avail < emergency);
         const bool in_cooldown = t < cooldown_until;
-        // How much to release to lift free RAM back to the target.  When pressure came from the OS signal
-        // or the predictive trend rather than the free-RAM target, avail may still be above `keep_free`;
-        // then aim for half the target, so the release is never zero under real pressure.  On later polls
-        // (already under pressure) a zero deficit means "free RAM is back at target" - keep the ceiling.
-        uint64_t want_free = keep_free > avail ? keep_free - avail : 0;
-        if (want_free == 0 && pressure_now && !low) want_free = keep_free / 2;
+        const GuardDecision dec = memory_guard_decide(cfg, low,
+                                                      have_ms ? (avail >> 20) : 0,
+                                                      have_ms ? (commit >> 20) : 0,
+                                                      notify_low, in_cooldown, slope);
 
-        bool want;
-        if (low) {
-            // Hold until both floors are clear, unless it is an emergency (then keep acting).
-            want = !(have_ms && avail > keep_free + recover && avail > min_avail + recover &&
-                     commit > min_commit + recover) ||
-                   emergency_now;
-        } else {
-            want = pressure_now && (!in_cooldown || emergency_now);
-        }
-
-        if (want != low) {
-            low = want;
-            g_pressure_low.store(low, std::memory_order_relaxed);
-            if (low) {
-                // Remember the working set the release is measured against: this is the engine at the
-                // moment pressure began, not the tiny readback after a previous trim.
-                sc.base_ws = ws;
-                const bool prio = cfg.priority && set_memory_priority(kMemoryPriorityVeryLow);
-                if (cfg.trim == MemGuardTrim::Hard || (cfg.trim == MemGuardTrim::Soft && emergency_now)) {
-                    const uint64_t before = working_set_bytes();
-                    if (K32EmptyWorkingSet(GetCurrentProcess()) != 0) ++hard_trims;
-                    last_trim = t;
-                    std::fprintf(stderr,
-                                 "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB, ws %llu MiB); "
-                                 "trimmed%s %llu -> %llu MiB, memory priority %s%s\n",
-                                 (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
-                                 (unsigned long long) (before >> 20), emergency_now ? " (emergency)" : "",
-                                 (unsigned long long) (before >> 20), (unsigned long long) (working_set_bytes() >> 20),
-                                 prio ? "VERY_LOW" : "unchanged", notify_low ? ", OS signalled low" : "");
-                } else if (cfg.trim == MemGuardTrim::Soft) {
-                    const uint64_t before = working_set_bytes();
-                    const uint64_t ceiling = soft_trim(want_free);
-                    std::fprintf(stderr,
-                                 "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB, ws %llu MiB); "
-                                 "soft ceiling -> %llu MiB, memory priority %s%s\n",
-                                 (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
-                                 (unsigned long long) (before >> 20), (unsigned long long) (ceiling >> 20),
-                                 prio ? "VERY_LOW" : "unchanged",
-                                 falling_fast ? ", predictive" : (notify_low ? ", OS signalled low" : ""));
-                } else {
-                    std::fprintf(stderr,
-                                 "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB); memory priority %s, "
-                                 "trim off%s\n",
-                                 (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
-                                 prio ? "VERY_LOW" : "unchanged", notify_low ? ", OS signalled low" : "");
-                }
-            } else {
-                clear_soft_ceiling(sc);
-                const bool prio = cfg.priority && set_memory_priority(kMemoryPriorityNormal);
-                cooldown_until = t + cfg.cooldown_ms;
+        // Release the deficit with the soft working-set ceiling: `target = entry_ws - deficit`, so the
+        // request is proportional to what is actually missing (the old code asked for a flat quarter of
+        // the target).  Priority stays VERY_LOW for the whole low state, so the OS keeps choosing the
+        // engine's clean pages over another app's dirty ones for as long as the pressure lasts.
+        if (dec.action == GuardAction::Enter) {
+            low = true;
+            g_pressure_low.store(true, std::memory_order_relaxed);
+            sc.base_ws = ws;   // the fallback ceiling is measured against the entry working set
+            const bool prio = cfg.priority && set_memory_priority(kMemoryPriorityVeryLow);
+            if (dec.emergency && cfg.trim != MemGuardTrim::Off) {
+                hard_trim("LOW (emergency)");
+            } else if (cfg.trim == MemGuardTrim::Off) {
                 std::fprintf(stderr,
-                             "strata memory-guard: recovered (RAM %llu MiB, commit %llu MiB); resuming%s\n",
+                             "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB); memory priority %s, "
+                             "trim off%s\n",
                              (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
-                             prio ? ", memory priority NORMAL" : "");
+                             prio ? "VERY_LOW" : "unchanged", notify_low ? ", OS signalled low" : "");
+            } else if (cfg.trim == MemGuardTrim::Hard) {
+                hard_trim("LOW (hard)");
+            } else {
+                const uint64_t before = working_set_bytes();
+                const uint64_t ceiling = soft_trim(dec.release_mib << 20);
+                std::fprintf(stderr,
+                             "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB, ws %llu MiB); "
+                             "soft ceiling -> %llu MiB, memory priority %s%s\n",
+                             (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
+                             (unsigned long long) (before >> 20), (unsigned long long) (ceiling >> 20),
+                             prio ? "VERY_LOW" : "unchanged",
+                             notify_low ? ", OS signalled low" : "");
             }
             std::fflush(stderr);
-        } else if (low) {
-            // Steady state.  Soft tracks the deficit every poll (a hint is cheap); a hard release is rate
-            // limited, and an emergency releases hard even in soft mode.
-            if (cfg.trim == MemGuardTrim::Soft) {
-                if (emergency_now) {
-                    if (!retrim || t - last_trim >= cfg.retrim_ms) hard_trim("still low (emergency)");
-                } else {
-                    soft_trim(want_free);
-                }
-            } else if (cfg.trim == MemGuardTrim::Hard && retrim && t - last_trim >= cfg.retrim_ms) {
-                const uint64_t before = working_set_bytes();
-                if (K32EmptyWorkingSet(GetCurrentProcess()) != 0) ++hard_trims;
-                const uint64_t after = working_set_bytes();
-                if (before > after)
-                    std::fprintf(stderr, "strata memory-guard: still low, trimmed working set %llu -> %llu MiB\n",
-                                 (unsigned long long) (before >> 20), (unsigned long long) (after >> 20));
-                std::fflush(stderr);
-                last_trim = t;
+        } else if (dec.action == GuardAction::Recover) {
+            low = false;
+            g_pressure_low.store(false, std::memory_order_relaxed);
+            clear_soft_ceiling(sc);
+            const bool prio = cfg.priority && set_memory_priority(kMemoryPriorityNormal);
+            cooldown_until = t + cfg.cooldown_ms;
+            std::fprintf(stderr,
+                         "strata memory-guard: recovered (RAM %llu MiB, commit %llu MiB); resuming%s\n",
+                         (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
+                         prio ? ", memory priority NORMAL" : "");
+            std::fflush(stderr);
+        } else if (dec.action == GuardAction::Stay) {
+            if (dec.emergency && cfg.trim != MemGuardTrim::Off) {
+                if (!retrim || t - last_trim >= cfg.retrim_ms) hard_trim("still low (emergency)");
+            } else if (cfg.trim == MemGuardTrim::Hard) {
+                if (retrim && t - last_trim >= cfg.retrim_ms) hard_trim("still low");
+            } else if (cfg.trim == MemGuardTrim::Soft && dec.release_mib > 0) {
+                soft_trim(dec.release_mib << 20);
             }
         } else if (cfg.verbose) {
             std::fprintf(stderr,
                          "strata memory-guard: RAM %llu MiB, commit %llu MiB, ws %llu MiB, slope %.0f MiB/s, "
-                         "pressure %s\n",
+                         "pressure idle\n",
                          (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
-                         (unsigned long long) (ws >> 20), slope, low ? "on" : "off");
+                         (unsigned long long) (ws >> 20), slope);
             std::fflush(stderr);
         }
 
@@ -571,11 +531,6 @@ uint64_t self_status_kib(const char* key) {
 
 void guard_loop(GuardState* s) {
     const MemoryGuardConfig& cfg = s->cfg;
-    const uint64_t keep_free = cfg.keep_free_mib << 20;
-    const uint64_t min_avail = cfg.min_avail_mib << 20;
-    const uint64_t min_commit = cfg.min_commit_mib << 20;
-    const uint64_t recover = cfg.recover_mib << 20;
-    const uint64_t band = cfg.predict_band_mib << 20;
 
     auto now_ms = [] {
         return (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -630,38 +585,38 @@ void guard_loop(GuardState* s) {
             have_prev = true;
         }
 
-        const bool falling_fast = cfg.predictive && have_prev && slope >= cfg.predict_slope_mib_s &&
-                                  avail <= keep_free + band;
-        const bool pressure_now = avail != 0 && (avail < min_avail || avail < keep_free ||
-                                                 (commit != 0 && commit < min_commit) || falling_fast);
         const bool in_cooldown = t < cooldown_until;
-        const bool want = low ? !(avail > keep_free + recover && avail > min_avail + recover &&
-                                  (commit == 0 || commit > min_commit + recover))
-                              : (pressure_now && !in_cooldown);
+        const GuardDecision dec = memory_guard_decide(cfg, low,
+                                                      avail != 0 ? (avail >> 20) : 0,
+                                                      commit != 0 ? (commit >> 20) : 0,
+                                                      /*os_low=*/false, in_cooldown, slope);
 
-        if (want != low) {
-            low = want;
-            g_pressure_low.store(low, std::memory_order_relaxed);
-            if (low)
-                std::fprintf(stderr,
-                             "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB, ws %llu MiB); "
-                             "pausing cold prefetch%s\n",
-                             (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
-                             (unsigned long long) (ws >> 20), falling_fast ? " (predictive)" : "");
-            else {
-                cooldown_until = t + cfg.cooldown_ms;
-                std::fprintf(stderr,
-                             "strata memory-guard: recovered (RAM %llu MiB, commit %llu MiB); resuming "
-                             "cold prefetch\n",
-                             (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20));
-            }
+        if (dec.action == GuardAction::Enter) {
+            low = true;
+            g_pressure_low.store(true, std::memory_order_relaxed);
+            // The kernel reclaims the engine's clean, file-backed expert pages by itself; the guard's job
+            // here is the prefetch pause (`g_pressure_low`) plus the same hysteresis as Windows.
+            std::fprintf(stderr,
+                         "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB, ws %llu MiB); "
+                         "pausing cold prefetch%s\n",
+                         (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
+                         (unsigned long long) (ws >> 20), dec.emergency ? " (emergency)" : "");
+            std::fflush(stderr);
+        } else if (dec.action == GuardAction::Recover) {
+            low = false;
+            g_pressure_low.store(false, std::memory_order_relaxed);
+            cooldown_until = t + cfg.cooldown_ms;
+            std::fprintf(stderr,
+                         "strata memory-guard: recovered (RAM %llu MiB, commit %llu MiB); resuming "
+                         "cold prefetch\n",
+                         (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20));
             std::fflush(stderr);
         } else if (cfg.verbose) {
             std::fprintf(stderr,
                          "strata memory-guard: RAM %llu MiB, commit %llu MiB, ws %llu MiB, slope %.0f MiB/s, "
-                         "pressure %s\n",
+                         "pressure idle\n",
                          (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
-                         (unsigned long long) (ws >> 20), slope, low ? "on" : "off");
+                         (unsigned long long) (ws >> 20), slope);
             std::fflush(stderr);
         }
 
@@ -719,6 +674,52 @@ bool memory_sample(MemorySample& out) {
     out.pagefile_usage = self_status_kib("VmSwap:") << 10;
     return out.total_phys != 0 || out.avail_phys != 0;
 #endif
+}
+
+GuardDecision memory_guard_decide(const MemoryGuardConfig& cfg, bool low, uint64_t avail_mib,
+                                  uint64_t commit_mib, bool os_low, bool in_cooldown, double slope_mib_s) {
+    GuardDecision d;
+    const bool have_avail = avail_mib != 0;
+    const bool commit_low = commit_mib != 0 && commit_mib < cfg.min_commit_mib;
+    // A fast decline starts the release a little early; the band is a lead, not a floor, so it stays
+    // close to the target (the old 2 GiB band triggered at ~2.5 GiB free and then recovered at 1 GiB -
+    // an inverted pair that pulsed the guard on every transient dip).
+    const bool predictive = cfg.predictive && have_avail && slope_mib_s >= cfg.predict_slope_mib_s &&
+                            avail_mib <= cfg.keep_free_mib + cfg.predict_band_mib;
+    const bool pressure = have_avail && (avail_mib < cfg.min_avail_mib || avail_mib < cfg.keep_free_mib) ||
+                          commit_low || os_low || predictive;
+    const bool emergency = have_avail && os_low && avail_mib < cfg.emergency_mib;
+
+    // Release up to the exit floor (`keep_free + recover`) so acting lifts free RAM clear of the entry
+    // band and the state does not flap; never less than `release_min_mib` once acting, because a
+    // sub-poll trim is wasted work.  This is the whole release: the source drops exactly these pages.
+    const uint64_t exit_floor = cfg.keep_free_mib + cfg.recover_mib;
+    auto deficit_mib = [&]() -> uint64_t {
+        const uint64_t gap = exit_floor > avail_mib ? exit_floor - avail_mib : 0;
+        return gap > cfg.release_min_mib ? gap : cfg.release_min_mib;
+    };
+
+    if (low) {
+        // Do not recover while the OS still says memory is low: its low-memory notification can stay
+        // signalled for the whole of a sustained load while free RAM is already above the exit floor, and
+        // recovering then re-entering every poll flapped the priority.  Hold the yield until the OS clears.
+        const bool recovered = have_avail && !os_low && avail_mib > exit_floor &&
+                               avail_mib > cfg.min_avail_mib + cfg.recover_mib &&
+                               (commit_mib == 0 || commit_mib > cfg.min_commit_mib + cfg.recover_mib);
+        if (recovered && !emergency) { d.action = GuardAction::Recover; return d; }
+        d.action = GuardAction::Stay;
+        d.release_mib = have_avail ? deficit_mib() : 0;
+        d.emergency = emergency;
+        return d;
+    }
+    // A genuine cliff ignores the cooldown: the OS signal plus free RAM under the emergency floor must
+    // release now, not after the settle window (the old loop exempted emergency the same way).
+    if ((pressure && !in_cooldown) || emergency) {
+        d.action = GuardAction::Enter;
+        d.release_mib = have_avail ? deficit_mib() : 0;
+        d.emergency = emergency;
+    }
+    return d;
 }
 
 bool memory_guard_start(const MemoryGuardConfig& cfg, std::string& why) {

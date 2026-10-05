@@ -48,19 +48,37 @@ Outputs (`<Tag>.engine.log`, `<Tag>.samples.csv`, `<Tag>.bench.log`, ...) land n
 ## What to look for
 
 - The engine log's `strata memory-guard:` lines: `LOW ... soft ceiling -> N MiB` on a release,
-  `recovered ...` when it lifts. No `memory-guard:` line means the guard did not engage.
-- In `<Tag>.samples.csv`: `avail_mib` should stay off the floor, and `page_out_total` / `pagefile_mb`
-  should stay low - the guard moves pages to standby, it does not write them to disk.
-- `guard-summary.ps1` prints the page-file **volume** written over the run and (when the hog was active)
-  over just the hog-active window.
+  `recovered ...` when it lifts, and `still low, trimmed ...` for a hard release. No `memory-guard:` line
+  means the guard did not engage.
+- In `<Tag>.samples.csv`: `avail_mib` should stay off the floor; `strata_pf_mib` (the engine's own page-file/commit
+  use) should stay flat, and `strata_faults` should not spike - the guard moves clean pages to standby, it does not
+  write them to disk. `strata_ws_mib` should fall by roughly the released amount, not collapse to near zero.
+- `guard-summary.ps1` prints the page-file **volume** written over the run, the engine's page-file/fault range, and
+  (when the hog was active) over just the hog-active window.
 - `STRATA_MEM_GUARD_STATS=1` (on by default here) also prints the monitor thread's own CPU share.
+
+## Measured
+
+On this rig (Windows 11, 32 GB, RTX 5060 Ti + RTX 3060, IQ3_XXS), the best two-card config
+(`--host-budget-gib 6`, CUDA1 helper 6250), 32K prefill / 5K decode, **one run each**:
+
+| Arm | Prefill t/s | Decode t/s | Cache hit |
+| --- | ---: | ---: | ---: |
+| best config + guard, no hog | **900.5** | **51.8** | 86.2% |
+| 12 GiB active hog, guard | 805.1 | 32.5 | - |
+
+The no-pressure run is the regression check: the guard costs nothing when RAM is not short (it matches the config
+without the guard within the +/-5% run-to-run spread). Under the 12 GiB active hog the guard pauses cold prefetch while
+the OS reports low memory, and keeps the other app's pages out of the page file. These are single runs on a PC that
+sits near full - indicative, not precise. The guard itself, and the numbers behind it, are in
+[`../../../STRATA-CASCADE.md`](../../../STRATA-CASCADE.md) ("The memory guard").
 
 ## Knobs
 
 `guard-test.ps1` exposes the `STRATA_MEM_GUARD_*` settings as parameters; the defaults are the shipped
-ones (`soft` trim, `keep_free` 512 MiB, `emergency` 256 MiB). `-GuardTrim hard` reproduces the
-pre-ladder behaviour (`EmptyWorkingSet`); `-GuardNotify 0`/`-GuardPredict 0` disable the OS
-notification / predictive triggers. The engine reads them from the run config's `env` block, which the
+ones (`soft` trim, `keep_free` 1024 MiB, `recover` 1024 MiB, `release_min` 256 MiB, `emergency` 256 MiB).
+`-GuardTrim hard` reproduces the pre-ladder behaviour (`EmptyWorkingSet`); `-GuardNotify 0`/`-GuardPredict 0`
+disable the OS notification / predictive triggers. The engine reads them from the run config's `env` block, which the
 script fills in.
 
 The bundled bench prompt is synthetic and **overfits** - confirm any tuning on your real workload.

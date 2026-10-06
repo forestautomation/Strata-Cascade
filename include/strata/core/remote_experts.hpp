@@ -40,6 +40,12 @@ public:
     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
     bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
+    /// Whether this helper currently holds `(layer, expert)` in its device cache.  Used by the adaptive tier so a
+    /// pair this GPU already computes is never pulled into the primary cache as well (which would duplicate GPU
+    /// work and evict a genuine miss).
+    bool holds(int64_t layer, int64_t expert) const {
+        return cache_.valid() && cache_.slot_of(layer, expert) >= 0;
+    }
     bool finish(float* out, std::string& err);
     int64_t resident() const { return cache_.resident(); }
     int64_t computed() const { return computed_; }

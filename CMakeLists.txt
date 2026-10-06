@@ -434,7 +434,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
-    src/core/remote_expert_opt.cu
+    src/core/remote_expert_opt.cu src/core/tiered_source.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
@@ -448,6 +448,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(exchange_storage_test PROPERTIES TIMEOUT 60)
   endif()
 
+  # native mmap FileExpertSource: variable per-layer strides, exact blob bytes, axis bounds, truncation, close
+  # and canonical compatibility.  Standalone (available in a source distribution without tests/), like the old
+  # win-mmap branch.
+  add_executable(native_mmap_test src/core/native_mmap_test.cpp)
+  target_link_libraries(native_mmap_test PRIVATE strata_engine)
+  add_test(NAME native_mmap_test COMMAND native_mmap_test)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)

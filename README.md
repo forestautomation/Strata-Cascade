@@ -1,3 +1,247 @@
+<p align="center"><img src="docs/media/strata-cascade-banner.png" width="1280" alt="Strata-Cascade - a cascading expert source that runs a 125B model FASTER on a 32 GB RAM, 16 GB VRAM PC, and possibly smaller"></p>
+
+<h1 align="center">Strata-Cascade</h1>
+
+<p align="center"><b>Run a 125-billion-parameter AI model FASTER on a 32 GB RAM, 16 GB VRAM PC and possibly smaller - even when its experts do not fit in RAM.</b></p>
+
+<p align="center">
+  <img alt="Windows" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square">
+  <img alt="Linux" src="https://img.shields.io/badge/Linux-supported-FCC624?style=flat-square&logo=linux&logoColor=black">
+  <img alt="NVIDIA" src="https://img.shields.io/badge/NVIDIA-RTX%2020--50-76B900?style=flat-square&logo=nvidia&logoColor=white">
+  <img alt="AMD" src="https://img.shields.io/badge/AMD-RX%207000--9000-ED1C24?style=flat-square&logo=amd&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
+  <img alt="Fork of upstream Strata" src="https://img.shields.io/badge/fork%20of-Niko1221%2FStrata-555?style=flat-square">
+</p>
+
+Strata-Cascade is a fork of **[Niko1221/Strata](https://github.com/Niko1221/Strata)**. Upstream already streams a
+model too big for your RAM from the SSD; this fork goes further and **uses every fast place at once** - both graphics
+cards, a page-locked slice of system RAM, and the SSD - so a machine whose RAM cannot hold the experts keeps
+generating at 128K context instead of collapsing into the page file.
+
+> [!IMPORTANT]
+> Everything upstream already does - the installer, the app, the API, every model size, AMD and multi-GPU support -
+> is **unchanged**. This fork only adds the cascade. If you already run upstream Strata, you can keep your existing
+> files: **[see below](#already-run-upstream-reuse-your-files)**.
+
+## What this fork solves
+
+A 125B model's experts are ~24 GB in [Qwen3.8-Flash-Next IQ3_XXS](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS).
+On a 32 GB PC, upstream must either keep them in RAM (no room) or stream every miss from the SSD - so the experts
+either do not fit or the answer stalls on the disk. That is the exact case this fork fixes:
+
+- **Every tier at once.** The experts are split across VRAM, a page-locked slice of RAM and the SSD - and, with a
+  second card present, a helper cache that upstream **refuses to combine with the RAM tier at all**.
+- **RAM that stays locked.** The hottest remaining experts live in a **page-locked budget**, so throughput stops
+  depending on whether the OS file cache happens to be warm.
+- **The SSD off the critical path.** Cold experts stream **ahead of the CPU**, a ring of reads in flight, instead of
+  blocking on each miss.
+- **A machine that stays usable.** The optional **memory guard** makes the engine the cheapest victim when RAM runs
+  short, instead of paging *your* apps to a slow disk. Turning that churn into clean, file-backed pages it can drop
+  rather than write out **could also mean less SSD wear** (how much depends on your system and what else is running).
+
+## Why it runs faster
+
+**What this build is:** upstream Strata **v0.1.39** (`origin/main` `6f32ec0`) plus the cascade port - the *same* upstream
+base, so the numbers below isolate the fork and nothing else. Two ideas do the work, and both show up as raw numbers (same PC, same model,
+same context - full method in [`STRATA-CASCADE.md`](STRATA-CASCADE.md)):
+
+**Test rig:** AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB (PCIe 4.0 x8/x8),
+SK hynix P41 2 TB (PCIe 4.0) SSD, Windows 11.
+
+| What changed | Stock upstream | Strata-Cascade | |
+| --- | ---: | ---: | --- |
+| **Decode** - writes answers | 42.5 t/s | **51.8 t/s** | **1.2x** |
+| **Prefill** - reads your prompt | 253 t/s | **900 t/s** | **3.6x** |
+
+The cascade's win is not the cache hit rate: upstream's newer cache path (`--remote-expert-opt`, on in the stock
+arm) brings stock to the same ~87% (see **Results**). It is **keeping the SSD reads in flight** and **spending
+every tier once**:
+
+- **Prefetch, don't stall.** A ring of up to ~48 SSD reads stays in flight while the GPU computes the previous
+  layer. Upstream beside a helper reads each miss synchronously - which is why its prompt reading stalls at 253 t/s.
+- **Spend every tier once.** `settle` sorts each expert into exactly one of VRAM / pinned RAM / SSD, so no expert is
+  duplicated on a card and in RAM, and the pinned budget goes only to blobs *no* GPU computes.
+
+## Results
+
+**Qwen3.8-Flash-Next IQ3_XXS, 128K context** (8-bit KV), 32K prompt / 5K reply,
+vision on. Both current arms are fresh builds of the **same** upstream base (v0.1.39, `origin/main` `6f32ec0`), one
+run each, on the same PC (AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB over PCIe 4.0 x8/x8,
+SK hynix P41 2 TB SSD, Windows 11). The model is ISTA-DASLab's [IQ3_XXS quant](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS)
+of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) - the exact one setup downloads:
+
+| Config | Decode | Prefill | Cache hit |
+| --- | ---: | ---: | ---: |
+| Upstream, dual-GPU (`--mmap-experts` + CUDA1 helper + `--remote-expert-opt`) | 42.5 t/s | 252.9 t/s | 87.4% |
+| **Strata-Cascade, 2 cards + memory guard** | **51.8 t/s** | **900.5 t/s** | **86.2%** |
+| Strata-Cascade, 1 card (`--low-ram tiered`) | 28.2 t/s | ~960 t/s | 38% |
+| Upstream, low-RAM mode, 1 GPU (`--resident-experts`) | 7.6 t/s \* | ~200 t/s \* | 37% |
+
+\* Upstream's one-card mode at this context **thrashed the pagefile and froze the PC** (826 s for one 5K reply); with
+a warm OS file cache it posts 29.7 t/s / 434 t/s, so it lives or dies by the page cache. The cascade does not - its
+RAM budget is *pinned*.
+
+The current best two-card run adds the **memory guard** (see
+[`STRATA-CASCADE.md`](STRATA-CASCADE.md#the-memory-guard-opt-in)) to the layout above: 51.8 t/s decode / 900.5 t/s
+prefill / 86.2% hit, the fastest measured here. It is a single run; the guard's measured job is to keep the machine
+usable, not to add throughput.
+
+> [!NOTE]
+> Measured on **Windows 11** (AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB over PCIe 4.0
+> x8/x8, SK hynix P41 2 TB SSD). The Linux path is
+> implemented but **not yet measured** - please share your numbers. Rig, method and every figure:
+> [`STRATA-CASCADE.md`](STRATA-CASCADE.md).
+
+## Compatibility
+
+Exactly what upstream needs - **nothing extra to install**:
+
+| | |
+| --- | --- |
+| **Graphics card** | **16 GB of VRAM or more** - a 16 GB card alone is the setup shown here; a **second card is optional and adds speed**, and **less VRAM works, just slower**. Either both NVIDIA or both AMD ([upstream's card list](#what-you-need)) |
+| **RAM** | **32 GB or more**; the less you have, the more the cascade helps |
+| **System** | **Windows** or **Linux**; **NVIDIA-only or AMD-only** (no mixed setups) |
+| **Disk** | an SSD matters more here - the cold experts stream from it |
+
+The cascade earns its keep only when the experts **do not fit RAM**. **One card works** (the setup shown above); an
+optional **second GPU holds a helper cache** and is where the biggest extra speed comes from - and **more VRAM means
+more speed**, since more experts stay resident. A big card with enough RAM (e.g. a 3090 24 GB with 64 GB) needs no
+cascade at all.
+
+## Install
+
+> [!TIP]
+> **Already run upstream Strata?** Skip to [Reuse your files](#already-run-upstream-reuse-your-files) - it will not
+> re-download anything.
+
+### The easy way (recommended)
+
+Download or `git clone` this fork, then run:
+
+- **Windows:** double-click **`START-HERE.bat`**
+- **Linux:** `./setup.sh`
+
+It is the **same installer and walkthrough as upstream**: it checks your PC, asks a few questions (each with a
+recommended default - just press Enter), downloads the model (~70 GB, resumable), prepares it, and starts the app at
+`http://127.0.0.1:8080`. Want to see what it thinks of your PC first, without installing anything? Run it with
+**`--check`**.
+
+Setup writes your machine's settings to **`strata-<model>.json` in the Strata folder** - that is where the cascade
+flags live, and what the tuner and the server read.
+
+**The cascade turns on by itself** when *all* of these are true:
+
+1. you are running this fork's engine, **and**
+2. the model's experts do **not** fit your RAM (the same test that picks upstream's low-RAM mode), **and**
+3. your PC has a **second usable graphics card** (it becomes the helper cache).
+
+**On a single card, setup asks** (it recommends **yes**) - the cascade pins what RAM allows and streams the rest,
+without the helper's extra speed. If RAM holds the whole model, no cascade is offered (there is nothing to gain). Force
+it on with `--low-ram tiered`, off with `--low-ram resident` or `--low-ram off`. Setup configures the cascade flags for
+you and prints them - the other cascade *prompt* is at the end, where it **offers** to tune the layout (it defaults to
+**No**; you can run it any time - see [Tuning](#tuning-both-systems)).
+
+### Build the engine yourself
+
+The ready-made engine covers RTX 20/30/40/50; build from source if your card is outside that list, you are on AMD, or
+you want to hack on the cascade.
+
+The easy way is to let setup do it: **`START-HERE.bat --build`** / **`./setup.sh --build`** (it finds the right CUDA
+arch and compiler for your card). By hand, the flag is `-DCMAKE_CUDA_ARCHITECTURES` (your card's compute capability,
+e.g. `120` for RTX 50, `86` for RTX 30):
+
+```powershell
+# Windows (Visual Studio 2022 + CUDA Toolkit, run from a "x64 Native Tools" prompt)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build --target strata
+```
+
+```bash
+# Linux (CUDA Toolkit)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build --target strata
+```
+
+Setup expects the finished `strata`/`strata.exe` in `<repo>/build/` (its own build folder). Exact flags per card,
+AMD (HIP), and every option: [`docs/strata-cascade-implementation-guide.md`](docs/strata-cascade-implementation-guide.md)
+and [`docs/INSTALL.md`](docs/INSTALL.md).
+
+## Already run upstream? Reuse your files
+
+Your model lives in a **`Strata-data` folder next to the repo** (`models/`, `packs/`, `mtp/`) - and that folder is
+shared per user, not per Strata copy. So a fork installed **beside your upstream folder finds the same files**, and
+**every setup step is skipped when it is already done**:
+
+- the ~70 GB model download,
+- the prepared `packs/<model>/experts.bin` (the cascade reuses the file upstream wrote),
+- the MTP draft layer.
+
+Put the fork next to your existing Strata folder (or point setup at the data folder) and run `START-HERE.bat` /
+`./setup.sh` - it reuses everything and just installs the cascade engine (a ready-made build on RTX 20-50). Already
+have GGUFs elsewhere? Point setup at them with `--gguf-dir` (or `--models-dir`).
+
+**You do not have to make an expert profile.** Setup already passes `--expert-profile`, pointing at the shipped
+`data/expert-profile.bin` (or the Coder's). `tools/make_profile.py` only **refines** that profile with your own
+traffic - optional.
+
+## Tuning (both systems)
+
+How much to pin in RAM, how big the helper cache is, and how much to leave the OS all depend on your machine. The
+shipped tuner sweeps a few layouts and keeps the fastest. **Setup offers this at the end of an install** (default
+**No**); these run it whenever you like:
+
+**Easiest - let setup do it:**
+
+- **Windows:** `START-HERE.bat --tune-cascade`
+- **Linux:** `./setup.sh --tune-cascade`
+
+**Or run the tuner directly** (both work with no arguments - they use the config setup wrote):
+
+```powershell
+# Windows
+tools\cascade_bench\tune-cascade.ps1
+tools\cascade_bench\tune-cascade.ps1 -Config strata-<model>.json
+```
+
+```bash
+# Linux
+tools/cascade_bench/tune-cascade.sh
+tools/cascade_bench/tune-cascade.sh --config strata-<model>.json
+```
+
+It runs unattended for 10-20 minutes (no prompts) and writes the winning layout over your config; add `-Guard` /
+`--guard` to also A/B the memory guard. The bench prompt is synthetic and **overfits** - treat the result as a
+starting point and confirm it on your real workload. Every setting, the log lines and exactly what the tuner changes:
+**[docs/TUNING.md](docs/TUNING.md)**.
+
+## Docs
+
+| Document | What it covers |
+| --- | --- |
+| [`STRATA-CASCADE.md`](STRATA-CASCADE.md) | The fork's design, the **memory guard**, and every measured number. |
+| [`docs/TUNING.md`](docs/TUNING.md) | Every setting, the engine log lines to watch, and the layout tuner. |
+| [`docs/strata-cascade-implementation-guide.md`](docs/strata-cascade-implementation-guide.md) | The code changes, file by file. |
+
+## Attribution and license
+
+The MIT license, credits, model and "Buy Me a Coffee" link are **upstream's** - the coffee is for
+[Niko1221/Strata](https://github.com/Niko1221/Strata). Strata-Cascade's own work is the
+**pinned-RAM-budget + second-GPU-cache combination upstream refuses**, the **adaptive-promotion rule** (Phase C),
+the optional **memory guard** (Windows full yield; Linux prefetch pause), setup's automatic selection and the
+**layout tuner**. The tiered expert source adapts the algorithm of upstream
+[PR #80](https://github.com/Niko1221/Strata/pull/80) by @andrewcoul (closed upstream), with parts rewritten so it
+works on Windows; everything else is upstream Strata.
+
+---
+
+## Everything below is upstream Strata
+
+The base project this fork builds on - *not* the cascade. **Kept verbatim** so it can be replaced wholesale when
+upstream changes: on a merge, refresh everything from the marker below to the end of the file. If you are not using
+the cascade, upstream's own README applies as-is.
+
+<!-- Everything below is upstream Strata's README, kept verbatim so it can be replaced when upstream changes it. -->
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)

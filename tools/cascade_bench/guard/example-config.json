@@ -1,0 +1,67 @@
+{
+    "exe":  "C:\\path\\to\\strata-main\\build\\strata.exe",
+    "args":  [
+                 "--pack",
+                 "C:\\path\\to\\strata\\packs\\iq3_xxs",
+                 "--native",
+                 "C:\\path\\to\\models\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+                 "--ple-gguf",
+                 "C:\\path\\to\\models\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+                 "--expert-profile",
+                 "C:\\path\\to\\strata-main\\data\\expert-profile.bin",
+                 "--expert-cache",
+                 "auto",
+                 "--tiered-experts",
+                 "--host-budget-gib",
+                 "4",
+                 "--host-reserve-gib",
+                 "6",
+                 "--spec",
+                 "4",
+                 "--spec-min-p",
+                 "0.5",
+                 "--mtp",
+                 "C:\\path\\to\\strata\\mtp\\rt",
+                 "--prefill",
+                 "auto",
+                 "--max-context",
+                 "131072",
+                 "--kv",
+                 "int8",
+                 "--kv-resident",
+                 "20480",
+                 "--expert-cache-device1",
+                 "6250",
+                 "--vram-reserve-mib",
+                 "1000",
+                 "--adapt-every",
+                 "8",
+                 "--adapt-swaps",
+                 "32",
+                 "--vision"
+             ],
+    "cwd":  "C:\\path\\to\\strata-main",
+    "tokenizer":  "C:\\path\\to\\strata\\packs\\iq3_xxs\\tokenizer",
+    "model_name":  "qwen3.8-flash-next-iq3_xxs",
+    "host":  "127.0.0.1",
+    "port":  1234,
+    "vision":  {
+                   "exe":  "C:\\path\\to\\strata-main\\build\\strata-vision.exe",
+                   "mmproj":  "C:\\path\\to\\models\\mmproj-BF16.gguf",
+                   "model":  "C:\\path\\to\\models\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+                   "gpu":  true,
+                   "max_tokens":  1024
+               },
+    "gpu":  [
+                0
+            ],
+    "lib_dirs":  [
+                     "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin",
+                     "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin\\x64",
+                     "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\lib64"
+                 ],
+    "env":  {
+
+            },
+    "log":  "tools\\cascade_bench\\guard\\guard.engine.log"
+}

@@ -898,6 +898,7 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
 
 void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (strata::platform::memory_pressure_low()) return;   // the memory guard pauses fetch under pressure
     std::vector<Fill> todo;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -1386,6 +1387,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
     if (role_ptr_.empty() || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (strata::platform::memory_pressure_low()) return;   // the memory guard pauses warm-up under pressure
     uint32_t stamp;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);

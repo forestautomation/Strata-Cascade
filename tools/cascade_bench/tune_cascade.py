@@ -373,6 +373,11 @@ def one_layout(cfg, layout, python_exe, port, max_tokens, repeats, tag, i, total
     else:
         eargs = set_flag(eargs, "--adapt-every", 0)
         eargs = set_flag(eargs, "--adapt-swaps", 0)
+    # The prefill-chunk A/B sets a ceiling for `auto` (the prompt path still picks the largest chunk whose device
+    # buffers fit the expert cache).  A bigger chunk reads each cold expert once per chunk instead of once per 8K
+    # chunk, so a long prompt reads far fewer bytes.
+    if layout.get("prefill"):
+        eargs = set_flag(eargs, "--prefill", layout["prefill"])
     # The guard A/B: force the guard on/off for this run.  Always drop both the canonical and the legacy
     # spelling first, so a base config that already has one cannot leak into the "off" arm.
     if guard_flag is not None:
@@ -487,6 +492,11 @@ def main():
     ap.add_argument("--guard-flag", default="--memory-guard",
                     help="the engine flag the guard A/B toggles (default --memory-guard; the alias "
                          "--windows-memory-guard always works and is dropped first)")
+    ap.add_argument("--prefill-ceilings", default="auto,auto:16384",
+                    help="comma list of --prefill values to A/B on the winning layout (a bigger chunk reads each "
+                         "cold expert once per chunk, so a long prompt reads fewer bytes; measured 605 -> 900 t/s "
+                         "on a 32 GB two-card cascade). The chunk's host staging buffers scale with it, so on a "
+                         "big-RAM PC add auto:32768; empty string skips the step")
     args = ap.parse_args()
 
     if in_wsl():
@@ -654,6 +664,16 @@ def main():
         return 1
     best = max(usable, key=lambda r: r["decode_t_s"])
 
+    # The winning layout, reused by the guard and prefill A/B steps below.
+    best_layout = {
+        "host_budget_gib": best["host_budget_gib"],
+        "host_reserve_gib": best["host_reserve_gib"],
+        "vram_reserve_mib": best["vram_reserve_mib"],
+        "helper_size": best.get("helper_size") or 0,
+        "helper_size_2": best.get("helper_size_2") or 0,
+        "helper_size_3": best.get("helper_size_3") or 0,
+    }
+
     # --- the guard step: A/B the winning layout with the memory guard on and off -----------------------
     # The guard trades a little engine throughput for a responsive system: it pauses cold prefetch under
     # pressure and (on Windows) trims its own working set.  On Linux only the prefetch pause applies, so
@@ -662,14 +682,6 @@ def main():
     guard_helps = None
     if args.guard:
         log("\n==== guard A/B on the winning layout ====")
-        best_layout = {
-            "host_budget_gib": best["host_budget_gib"],
-            "host_reserve_gib": best["host_reserve_gib"],
-            "vram_reserve_mib": best["vram_reserve_mib"],
-            "helper_size": best.get("helper_size") or 0,
-            "helper_size_2": best.get("helper_size_2") or 0,
-            "helper_size_3": best.get("helper_size_3") or 0,
-        }
         for j, use_guard in enumerate((False, True), 1):
             gl = dict(best_layout)
             gl["guard"] = use_guard
@@ -694,9 +706,42 @@ def main():
         else:
             log("  guard A/B did not complete; see the engine logs in %s" % out_dir)
 
+    # --- the prefill step: A/B the chunk ceiling on the winning layout ---------------------------------
+    # A bigger prompt chunk reads each cold expert once per chunk instead of once per 8K chunk, so a long prompt
+    # reads far fewer bytes (measured on a 32 GB two-card cascade: 129.4 -> 71.2 GB of cold reads, 605 -> 900 t/s).
+    # The chunk's host staging buffers scale with it, so on a low-RAM PC the bigger ceiling can lose - the bench
+    # decides on THIS machine.  `auto:N` only raises the ceiling; the engine still picks the largest chunk whose
+    # device buffers fit the expert cache, so a short prompt is unaffected.
+    prefill_rows = []
+    prefill_helps = None
+    ceilings = [c.strip() for c in (args.prefill_ceilings or "").split(",") if c.strip()]
+    if ceilings:
+        log("\n==== prefill-chunk A/B on the winning layout ====")
+        gflag = args.guard_flag if args.guard else None
+        for j, ceiling in enumerate(ceilings, 1):
+            pl = dict(best_layout)
+            pl["prefill"] = ceiling
+            if args.guard and guard_helps is not None:
+                pl["guard"] = guard_helps
+            row = one_layout(cfg, pl, args.python, args.port, args.max_tokens, args.repeats,
+                             args.tag + "-prefill", j, len(ceilings), out_dir, guard_flag=gflag)
+            if row:
+                row["prefill_ceiling"] = ceiling
+                prefill_rows.append(row)
+        ok_rows = [r for r in prefill_rows if r.get("decode_t_s", 0) > 0]
+        if ok_rows:
+            for r in ok_rows:
+                log("  --prefill %s: decode %s t/s  prefill %s t/s  hit %s%%"
+                    % (r["prefill_ceiling"], r["decode_t_s"], r["prefill_t_s"], r["hit_pct"]))
+            pbest = max(ok_rows, key=lambda r: r["prefill_t_s"])
+            prefill_helps = pbest["prefill_ceiling"]
+            log("  -> keep --prefill %s in the winning config" % prefill_helps)
+        else:
+            log("  prefill A/B did not complete; see the engine logs in %s" % out_dir)
+
     stamp = _dt.date.today().isoformat()
     csv_path = out_dir / ("tune-%s.csv" % stamp)
-    all_rows = rows + guard_rows
+    all_rows = rows + guard_rows + prefill_rows
     # union of keys across rows, so an `oom` row's field appears even if the first row lacks it
     keys = []
     for row in all_rows:
@@ -724,6 +769,9 @@ def main():
         win_cfg["args"] = remove_flag(win_cfg["args"], "--windows-memory-guard")
         win_cfg["args"] = (add_flag(win_cfg["args"], args.guard_flag) if guard_helps
                            else remove_flag(win_cfg["args"], args.guard_flag))
+    # the prefill A/B's verdict (or, when it did not run, the base config's own choice, untouched)
+    if prefill_helps:
+        win_cfg["args"] = set_flag(win_cfg["args"], "--prefill", prefill_helps)
     # Ship the guard knobs whenever the guard is on in the final config (the A/B's verdict, or the
     # base config's own choice when --guard was not given) and drop them when it is off - so the config is
     # self-describing and portable instead of relying on the engine's compiled defaults.
@@ -748,6 +796,8 @@ def main():
     else:
         log("  --adapt-every 0                    (one card: the adaptive tier hurts)")
     log("  decode %s t/s, prefill %s t/s, hit %s%%" % (best["decode_t_s"], best["prefill_t_s"], best["hit_pct"]))
+    if prefill_helps:
+        log("  --prefill %s   (the chunk A/B's winner)" % prefill_helps)
     if args.guard and guard_helps is not None:
         log("  memory guard: %s%s" % ("on" if guard_helps else "off",
             "" if guard_helps else " (the A/B measured a decode cost on this machine)"))

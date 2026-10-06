@@ -4046,6 +4046,11 @@ def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: st
 
 PREFILL_BIG_RAM_GB = 96        # bench #433 #440 #834 #669: --prefill auto:32768 +21-35% at 96 GB, ~3x slower at 32 GB
 PREFILL_RISK_RAM_GB = 64       # below this an explicit auto:32768 is warned about
+PREFILL_MID_RAM_GB = 32        # our bench: --prefill auto:16384 read a 32K prompt 48% faster (605 -> 900 t/s) on a
+                               # 32 GB two-card cascade, 129.4 -> 71.2 GB of cold expert reads; the chunk's host
+                               # staging buffers scale with it (the PLE embedding staging, ~2x T x n_embd x 4), so
+                               # below this the extra page-locked RAM is not worth it (auto:32768 is ~3x slower at
+                               # 32 GB, #834 #669)
 HEADROOM_RAM_GB = 48           # bench #834: STRATA_RESIDENT_HEADROOM_GIB=6 on a PC with this much RAM or less
 AGENT_CACHE_FREE_GB = 24       # bench #882 #440: RAM left beside the model for the conversation cache
 AGENT_CACHE_MIB = 8192
@@ -4070,7 +4075,10 @@ def bench_tips(args, env, ram: float, model_ram_gb: float, vram_gb: float, visio
     if prefill == "auto:32768" and ram < PREFILL_RISK_RAM_GB:
         tips.append(f"warning: --prefill auto:32768 on {ram:.0f} GB of RAM: it ran ~3x slower than --prefill auto with "
                     "32 GB (#834 #669); it paid off (+21-35%) with 96 GB")
-    elif prefill == "auto" and ram >= PREFILL_BIG_RAM_GB:
+    elif prefill == "auto:16384" and ram < PREFILL_MID_RAM_GB:
+        tips.append(f"warning: --prefill auto:16384 on {ram:.0f} GB of RAM: its host staging buffers scale with the "
+                    "chunk and cost page-locked RAM; below 32 GB keep --prefill auto")
+    elif prefill in ("auto", "auto:16384") and ram >= PREFILL_BIG_RAM_GB:
         tips.append(f"tip: with {ram:.0f} GB of RAM, --prefill auto:32768 in the config's args read prompts 21-35% "
                     "faster in community benchmarks (#433 #440 #834); not set, nothing changes")
     resident = any(a in args for a in ("--resident-experts", "--resident-budget-gib"))
@@ -5081,9 +5089,17 @@ def main() -> int:
     if ple is None:
         fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
     # (a 4-shard file: the engine finds the PLE table's shard itself from shard 1, the measured setup)
+    # The prompt path's chunk: a bigger one reads each cold expert once per chunk, so a long prompt reads far fewer
+    # bytes (measured 129.4 -> 71.2 GB, 605 -> 900 t/s on a 32 GB two-card cascade).  Gated on RAM - the chunk's host
+    # staging buffers scale with it.  `auto:N` only raises the ceiling; the engine still picks the largest chunk
+    # whose device buffers fit the expert cache, so a short prompt is unaffected.
+    prefill_chunk = "auto:16384" if ram >= PREFILL_MID_RAM_GB else "auto"
+    if prefill_chunk != "auto":
+        ok(f"prompt reading: --prefill {prefill_chunk} (a bigger chunk reads each cold expert once per chunk; "
+           "the engine still sizes it to the free VRAM)")
     args = ["--pack", str(pack), "--native", str(shards[0]), *(["--ple-gguf", str(ple)] if len(shards) <= 2 else []),
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
-            "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
+            "--prefill", prefill_chunk, "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
     if scaling is not None:     # the resolved config: explicit flags as given, or the automatic yarn+factor
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]

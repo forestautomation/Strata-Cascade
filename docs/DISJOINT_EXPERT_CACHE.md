@@ -12,7 +12,11 @@ in both the server and command-line generation paths.
 
 ## Use
 
-Set `STRATA_DISJOINT_ADAPT=1` before starting the engine. It is off by default.
+Set `STRATA_DISJOINT_ADAPT=1` before starting the engine. In upstream Strata it is off by default; in Strata-Cascade
+it is already **on** for the low-RAM cascade beside a helper GPU (`--tiered-experts` + `--expert-cache-device1..3`),
+the case this fork measured (one run each, 32 GB PC, IQ3_XXS, 32K prefill / 5K decode: decode 42.0 -> 50.6 tok/s,
+primary hit 84.0% -> 88.2%, CUDA1 entries 344053 -> 902002, decoded COLD 256852 -> 175961 MB).
+`STRATA_DISJOINT_ADAPT=0` opts out; `=1` forces it on everywhere.
 It leaves the existing peer-tier check and expert arithmetic unchanged.
 The check is live: each promotion candidate is asked of the helper's own cache (`RemoteExperts::holds`), so an expert
 the helper's tier swaps in or out later is followed (a mask copied at load would go stale). Needs the helper-share

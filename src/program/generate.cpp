@@ -4467,10 +4467,16 @@ int main(int argc, char** argv) {
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
-    // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
-    // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
+    // #731: the adaptive tiers leave an expert a helper GPU holds out of the primary's promotion candidates (it would
+    // sit in both caches and evict a genuine resident).  Asked live, from the helper's own cache (RemoteExperts::holds,
     // #854), so an expert the helper's tier swaps in or out later is followed - never a copy taken at load.
-    const bool disjoint_adapt = [] { const char* v = std::getenv("STRATA_DISJOINT_ADAPT"); return v != nullptr && std::atoi(v) != 0; }();
+    // Default: ON for the low-RAM cascade with a helper GPU (--tiered-experts + --expert-cache-device1..3) - the case
+    // this fork measured (decode 42.0 -> 50.6 tok/s, decoded COLD 257 -> 176 GB).  Upstream left it opt-in, so a
+    // high-RAM or single-GPU run keeps upstream's behavior.  STRATA_DISJOINT_ADAPT=0/1 overrides either way.
+    const char* disjoint_env = std::getenv("STRATA_DISJOINT_ADAPT");
+    const bool have_helper = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+    const bool disjoint_adapt = disjoint_env != nullptr ? (std::atoi(disjoint_env) != 0)
+                                                        : (o.tiered_experts && have_helper);
     auto helper_holds = [&](int64_t l, int32_t e) -> bool {
         if (!disjoint_adapt) return false;
         for (int r = 0; r < drive.d.remote_count; ++r)

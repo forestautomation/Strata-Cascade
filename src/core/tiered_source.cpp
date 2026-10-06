@@ -27,6 +27,32 @@
 #include <unistd.h>
 #endif
 
+// STRATA_PREFILL_TIMING: where the tiered source's streamed reads go (see tiered_read_report in expert_source.hpp).
+namespace strata::core {
+namespace {
+std::atomic<int64_t> g_direct_reads{0}, g_direct_bytes{0}, g_direct_us{0};
+std::atomic<int64_t> g_fb_reads{0}, g_fb_bytes{0}, g_fb_us{0};
+std::atomic<int64_t> g_pin_reads{0}, g_pin_bytes{0}, g_pin_us{0};
+inline int64_t us_now() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+std::string tiered_read_report() {
+    char b[320];
+    std::snprintf(b, sizeof b,
+        "tiered streamed reads: direct %lld (%.1f GB, %.0f ms) | mapped-memcpy fallback %lld (%.1f GB, %.0f ms) "
+        "| pinned memcpy %lld (%.1f GB, %.0f ms)",
+        (long long) g_direct_reads.load(std::memory_order_relaxed), g_direct_bytes.load(std::memory_order_relaxed) / 1e9,
+        g_direct_us.load(std::memory_order_relaxed) / 1000.0,
+        (long long) g_fb_reads.load(std::memory_order_relaxed), g_fb_bytes.load(std::memory_order_relaxed) / 1e9,
+        g_fb_us.load(std::memory_order_relaxed) / 1000.0,
+        (long long) g_pin_reads.load(std::memory_order_relaxed), g_pin_bytes.load(std::memory_order_relaxed) / 1e9,
+        g_pin_us.load(std::memory_order_relaxed) / 1000.0);
+    return b;
+}
+}  // namespace strata::core
+
 #if defined(_WIN32)
 // ---------------------------------------------------------------------------------------------------------------
 // THE WINDOWS TIERED SOURCE.  Same three tiers and the same one-time `settle`, but TWO address regions instead of
@@ -560,9 +586,12 @@ const uint8_t* TieredExpertSource::device_alias(int64_t layer, int64_t expert) c
 }
 
 void TieredExpertSource::read_into(const uint8_t* src, uint8_t* dst, size_t n) const {
+    const int64_t t0 = us_now();
     // Pinned or otherwise anonymous bytes are in RAM already: memcpy.
     if (pin_base_ != nullptr && src >= pin_base_ && src + n <= pin_base_ + pin_bytes_) {
         std::memcpy(dst, src, n);
+        g_pin_reads.fetch_add(1, std::memory_order_relaxed); g_pin_bytes.fetch_add((int64_t) n, std::memory_order_relaxed);
+        g_pin_us.fetch_add(us_now() - t0, std::memory_order_relaxed);
         return;
     }
     if (base_ != nullptr && src >= base_ && (uint64_t) (src - base_) + n <= file_bytes_) {
@@ -574,17 +603,27 @@ void TieredExpertSource::read_into(const uint8_t* src, uint8_t* dst, size_t n) c
         if (!locked) {
             // A streamed expert is read once per prompt chunk; through the page cache ~20 GB per long prompt would
             // evict the cold-tier pages decode relies on.  One unbuffered read instead of ~400 page faults.
-            if (read_direct_span((HANDLE) dfile_, file_bytes_, off, dst, n)) return;
+            if (read_direct_span((HANDLE) dfile_, file_bytes_, off, dst, n)) {
+                g_direct_reads.fetch_add(1, std::memory_order_relaxed); g_direct_bytes.fetch_add((int64_t) n, std::memory_order_relaxed);
+                g_direct_us.fetch_add(us_now() - t0, std::memory_order_relaxed);
+                return;
+            }
         }
     }
     std::memcpy(dst, src, n);
+    g_fb_reads.fetch_add(1, std::memory_order_relaxed); g_fb_bytes.fetch_add((int64_t) n, std::memory_order_relaxed);
+    g_fb_us.fetch_add(us_now() - t0, std::memory_order_relaxed);
 }
 
 void TieredExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
     if (base_ == nullptr || ids == nullptr || layer < 0 || layer >= n_layers_) return;
     ++pf_epoch_;   // one epoch per layer; blob() counts a cold read as prefetched only against the current layer
     static const bool no_pf = std::getenv("STRATA_NO_COLD_PREFETCH") != nullptr;   // the A/B arm
-    if (no_pf || strata::platform::memory_pressure_low()) return;   // the memory guard pauses it under pressure
+    // The memory guard's pause-on-pressure starved decode: with the prefetch off, every cold miss faulted from the
+    // SSD synchronously and the CPU pool's per-window time tripled (measured: 0% prefetched, ~20 t/s vs 97%, ~48).
+    // Off by default now; STRATA_PREFETCH_PAUSE_ON_PRESSURE=1 restores the old policy.
+    static const bool pause_pf = std::getenv("STRATA_PREFETCH_PAUSE_ON_PRESSURE") != nullptr;
+    if (no_pf || (pause_pf && strata::platform::memory_pressure_low())) return;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t pg = page_size();
     for (int64_t i = 0; i < k; ++i) {
@@ -1044,7 +1083,11 @@ void TieredExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t 
     if (base_ == nullptr || ids == nullptr || layer < 0 || layer >= n_layers_) return;
     ++pf_epoch_;   // one epoch per layer; blob() counts a cold read as prefetched only against the current layer
     static const bool no_pf = std::getenv("STRATA_NO_COLD_PREFETCH") != nullptr;   // the A/B arm
-    if (no_pf || strata::platform::memory_pressure_low()) return;   // the memory guard pauses it under pressure
+    // The memory guard's pause-on-pressure starved decode: with the prefetch off, every cold miss faulted from the
+    // SSD synchronously and the CPU pool's per-window time tripled (measured: 0% prefetched, ~20 t/s vs 97%, ~48).
+    // Off by default now; STRATA_PREFETCH_PAUSE_ON_PRESSURE=1 restores the old policy.
+    static const bool pause_pf = std::getenv("STRATA_PREFETCH_PAUSE_ON_PRESSURE") != nullptr;
+    if (no_pf || (pause_pf && strata::platform::memory_pressure_low())) return;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t pg = page_size();
     for (int64_t i = 0; i < k; ++i) {

@@ -62,13 +62,15 @@ What the guard does on Windows and Linux, and its measured numbers, are in
 knobs and how to test it.
 
 `--memory-guard` (alias `--windows-memory-guard`; env `STRATA_MEMORY_GUARD`, alias `STRATA_WINDOWS_MEMORY_GUARD`) is
-opt-in. On Windows it lowers the engine's memory priority, pauses cold prefetch and releases its cheap pages while RAM
-is short. The release is **proportional to the deficit**: the soft working-set ceiling is set to `entry_ws - deficit`,
+opt-in. On Windows it lowers the engine's memory priority and releases its cheap pages while RAM is short; it pauses
+cold prefetch only on an **emergency cliff** (`avail < STRATA_MEM_GUARD_EMERGENCY_MIB`, default 256), because the
+guard already yields by trimming and prefetched pages are clean and reclaimable. On Linux the guard's only lever is
+the prefetch pause, so there it tracks the whole low state. The release is **proportional to the deficit**: the soft working-set ceiling is set to `entry_ws - deficit`,
 where the deficit is what is missing to reach `keep_free + recover`, so the guard asks for exactly what it needs
 rather than a flat fraction of the target. It **holds** `VERY_LOW` memory priority for the whole low period, so the OS
 keeps choosing the engine's clean, file-backed COLD pages over another app's dirty ones. Three release modes on
-Windows, `STRATA_MEM_GUARD_TRIM`: `soft` (default), `hard` (`EmptyWorkingSet` at every trigger) or `off` (priority +
-prefetch pause only). The engine's locked footprint (registered experts plus pinned host KV) cannot be trimmed.
+Windows, `STRATA_MEM_GUARD_TRIM`: `soft` (default), `hard` (`EmptyWorkingSet` at every trigger) or `off` (priority
+only; prefetch still pauses on a cliff). The engine's locked footprint (registered experts plus pinned host KV) cannot be trimmed.
 
 > **No per-range drop on Windows.** `OfferVirtualMemory` looks like `madvise(MADV_DONTNEED)` but is not: it is rejected
 > for file mappings (`ERROR_INVALID_PARAMETER`) and, where it does work, it makes the range inaccessible until
@@ -108,6 +110,27 @@ layout with the guard on and off and keeps the flag only if it does not cost thr
 
 The guard does not make paging fast; it makes the engine the cheapest victim, so the OS drops its clean pages instead
 of paging your apps to the slow disk. Moving the page file to an SSD is still the real fix.
+
+---
+
+## 1c. The prompt chunk: `--prefill auto:16384`
+
+A long prompt is read in chunks, and every non-resident expert a chunk routes is streamed once **per chunk** - so a
+32K prompt read in 8K chunks reads each cold expert four times. A bigger chunk reads it fewer times: on this 32 GB
+two-card cascade, `--prefill auto:16384` took a 32K prompt from **129.4 GB of cold expert reads to 71.2 GB** and
+prefill from **605 to ~900 t/s**, with decode unchanged (IQ3_XXS, 32K/5K, memory guard off). The upstream feature is
+the ceiling `--prefill auto:N` (N = 16384 or 32768, #282); a bare `auto` tops out at 8192.
+
+`auto:N` only **raises the ceiling**: the engine still picks the largest chunk whose device buffers fit the expert
+cache (they are borrowed from it for the prompt and refilled after), so a short prompt is unaffected and a card that
+cannot afford the chunk falls back to a smaller one. The scan's lend cap can resolve `auto:16384` to less - on this
+rig it picked 15360 - and a forced `--prefill 16384` measured a little faster (~820 vs ~700 t/s prefill on the
+run-strata config); setup writes the ceiling form because it leaves the expert cache room. What it does **not** size is the chunk's **host staging
+buffers**, which scale with the chunk - the PLE embedding staging is about `2 x T x n_embd x 4` bytes (~170 MB at
+8192, ~335 MB at 16384) and is page-locked. That is why the choice is gated on RAM: setup writes `--prefill
+auto:16384` at 32 GB of RAM or more, and `auto:32768` stays a tip at 96 GB (it ran ~3x slower at 32 GB, #834 #669).
+The tuner A/Bs `auto` against `auto:16384` on the winning layout and keeps the faster one
+(`tune_cascade.py --prefill-ceilings`, default `auto,auto:16384`; add `auto:32768` on a big-RAM PC).
 
 ---
 
@@ -171,20 +194,24 @@ What it does, in order:
    band 512 MiB) through the config's `env`, and those knobs are written into the winning config when the guard is
    kept - the same on Linux and Windows (the Linux guard only pauses cold prefetch, so a near-zero delta is
    expected);
-6. writes `tools/cascade_bench/tune-<date>.csv` and prints the winning layout.
+6. A/Bs the **prompt chunk** on the winning layout - `--prefill auto` vs `auto:16384` (add `auto:32768` with
+   `--prefill-ceilings auto,auto:16384,auto:32768` on a big-RAM PC) - and keeps the faster one in the winning config
+   (section 1c); the rows land in the CSV with a `prefill_ceiling` column;
+7. writes `tools/cascade_bench/tune-<date>.csv` and prints the winning layout.
 
 **What it changes, and what it leaves alone.** Each layout starts from your existing `strata-<model>.json` and
 overwrites **only** `--host-budget-gib`, `--host-reserve-gib`, `--vram-reserve-mib` and the helper sizes
-(`--expert-cache-device1..3`), plus `--adapt-every`/`--adapt-swaps` (8/32 with a helper, 0/0 without). The memory guard
+(`--expert-cache-device1..3`), plus `--adapt-every`/`--adapt-swaps` (8/32 with a helper, 0/0 without) and, from the
+chunk A/B, `--prefill`. The memory guard
 is only touched with `--guard`/`-Guard`, which also writes the shipped `STRATA_MEM_GUARD_*` knobs into the config's
 `env` (and drops them when the A/B chose no guard). **Everything else is kept as-is** - the model, `--max-context`, the KV quant
 and `--kv-resident` (setup's own KV-streaming decision), speculation, vision, the expert profile, host/port and any
 other flag. So the tuner assumes an otherwise valid
 `--tiered-experts` config and optimizes the tier layout on top of it; it does not fix or validate the rest.
 
-It is deliberately **small**: 3 budgets x up to 3 helper sizes is ~10 model loads (with the one-shot probe), enough
-to find a good layout in about ten to twenty minutes depending on the model's load time. A full sweep would overfit
-the bench prompt (below).
+It is deliberately **small**: 3 budgets x up to 3 helper sizes is ~10 model loads (with the one-shot probe), plus the
+guard and chunk A/Bs (2 runs each, on the winning layout), enough to find a good layout in about ten to twenty
+minutes depending on the model's load time. A full sweep would overfit the bench prompt (below).
 
 **It knows the two rules the sweeps found.** With a helper the adaptive tier is on (`--adapt-every 8 --adapt-swaps
 32`); on one card it is off (`--adapt-every 0`), where it has nothing to protect and hurts. And a layout that
@@ -212,7 +239,7 @@ helper when no GPU is left over.
 
 | File | What |
 | --- | --- |
-| `tools/cascade_bench/tune-<date>.csv` | one row per layout: budget, helper, decode, prefill, hit, tier split |
+| `tools/cascade_bench/tune-<date>.csv` | one row per layout: budget, helper, decode, prefill, hit, tier split; plus the guard and chunk A/B rows (`memory_guard`, `prefill_ceiling`) |
 | `tools/cascade_bench/tune-<date>-best.json` | the winning config (copy it over your `strata-*.json`) |
 | `tools/cascade_bench/tune-<tag>-l<n>.engine.log` | the engine log of each run |
 

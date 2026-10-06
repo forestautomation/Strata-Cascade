@@ -336,6 +336,7 @@ struct Stager {
     // previous layer can never take a job of this one - the expert pool's issue #29 lesson)
     std::atomic<uint64_t> head{0};
     std::atomic<int> issued{0}, active{0};
+    std::atomic<int64_t> us_dmasync{0}, us_read{0};   // STRATA_PREFILL_TIMING: summed over the threads (us)
     uint32_t gen = 0;
     bool quit = false;
     std::mutex mu;
@@ -393,8 +394,11 @@ struct Stager {
                 // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                 // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
                 // was a ring entry the routing skipped (an event never recorded returns at once)
+                const auto tds = Clock::now();
                 cudaEventSynchronize(dma_done[b]);
+                us_dmasync.fetch_add((int64_t) (ms_since(tds) * 1000.0), std::memory_order_relaxed);
                 const Job& jb = jobs[(size_t) j];
+                const auto trd = Clock::now();
                 if (jb.from != nullptr) {
                     if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
                         std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
@@ -405,6 +409,7 @@ struct Stager {
                 } else {
                     std::memcpy(buf[b], jb.src, jb.bytes);
                 }
+                us_read.fetch_add((int64_t) (ms_since(trd) * 1000.0), std::memory_order_relaxed);
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
@@ -1701,6 +1706,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
+    // STRATA_PREFILL_TIMING: the stager threads' counters are cumulative; take this run's delta
+    const int64_t st_dm0 = m.stager ? m.stager->us_dmasync.load(std::memory_order_relaxed) : 0;
+    const int64_t st_rd0 = m.stager ? m.stager->us_read.load(std::memory_order_relaxed) : 0;
     const int64_t LB = stage_lb_, LE = stage_le_;
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
@@ -2041,7 +2049,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }();
         std::atomic<size_t> a_issued{0}, a_consumed{0};
         std::atomic<bool> a_stop{false};
-        double iss_ms = 0;
+        double iss_ms = 0, iss_stager_ms = 0;
         int64_t iss_streamed = 0, iss_dma = 0;
         std::thread issuer;
         struct IssuerJoin {
@@ -2067,7 +2075,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                         ++iss_dma;
                     } else {
+                        const auto tw = Clock::now();
                         const uint8_t* hb = m.stager->wait(en.job);
+                        iss_stager_ms += ms_since(tw);
                         cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
@@ -2082,9 +2092,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
         }
         // the consumer's side: entry k's copy is on the copy stream (the thread issued it), then k is given back
+        double launch_issued_ms = 0;   // STRATA_PREFILL_TIMING: the launcher waiting for the issuer
         auto wait_issued = [&](size_t k) {
             if (!threaded_issue) return;
+            const auto tw = Clock::now();
             while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+            launch_issued_ms += ms_since(tw);
         };
         auto give_back = [&](size_t upto) {
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
@@ -3229,9 +3242,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (issuer.joinable()) {
             issuer.join();
             stats_.ms_experts_host += iss_ms;
+            stats_.ms_iss_stager += iss_stager_ms;
+            stats_.ms_iss_enq += iss_ms - iss_stager_ms;
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
         }
+        stats_.ms_launch_issued += launch_issued_ms;
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
@@ -3360,6 +3376,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        std::fprintf(stderr, "strata prefill timing: host pipeline (ms): issuer stager-wait %.0f + enqueue %.0f | "
+                             "launcher wait-issued %.0f | stager threads dmasync %.0f + read %.0f (summed over threads)\n",
+                     stats_.ms_iss_stager, stats_.ms_iss_enq, stats_.ms_launch_issued,
+                     m.stager ? (double) (m.stager->us_dmasync.load() - st_dm0) / 1000.0 : 0.0,
+                     m.stager ? (double) (m.stager->us_read.load() - st_rd0) / 1000.0 : 0.0);
+        std::fprintf(stderr, "strata prefill timing: %s\n", strata::core::tiered_read_report().c_str());
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;

@@ -197,16 +197,26 @@ The tuned two-card config (paths shortened; yours point at your model folder):
 --tiered-experts --host-budget-gib 6 --host-reserve-gib 4
 --spec 4 --spec-min-p 0.5
 --mtp <data>\mtp\rt
---prefill auto --max-context 131072 --kv int8 --kv-resident 20480
+--prefill auto:16384 --max-context 131072 --kv int8 --kv-resident 20480
 --expert-cache-device1 6250 --vram-reserve-mib 1000
 --adapt-every 8 --adapt-swaps 32 --vision
---windows-memory-guard        # opt-in (alias --memory-guard); soft trims on Windows, prefetch pause on Linux
+# --prefill auto:16384: a bigger prompt chunk reads each cold expert once per chunk instead of once per 8K
+# chunk, so a 32K prompt read 71.2 GB of cold experts instead of 129.4 GB (prefill 605 -> ~900 t/s, decode
+# unchanged).  `auto:N` only raises the ceiling - the engine still sizes the chunk to the free VRAM.  The
+# chunk's host staging buffers scale with it, so setup.py writes auto:16384 only at 32 GB of RAM or more.
+# (no flag needed) the helper-disjoint adaptive tier is ON for this layout by default; upstream's
+# STRATA_DISJOINT_ADAPT defaults off.  Off here, the adaptive primary duplicates the helper's hot experts and
+# decode fell 50.6 -> 42.0 t/s (IQ3_XXS, 32K/5K).  STRATA_DISJOINT_ADAPT=0 turns it off.
+# optional, NOT in the recommended layout: --windows-memory-guard (alias --memory-guard) is for a page
+# file on a slow disk.  On the 0.1.40 cold bench it cost decode while the cascade streams from a fast
+# SSD - see "The memory guard" below.
 ```
 
 plus `gpu: [0, 1]` and `layer_split: null`. Setup writes a `--host-budget-gib` **scaled to the PC** when a helper is
 present (`min(6 GiB, free RAM - the 8 GiB reserve, ~45% of the primary card)`, floored at 2 GiB; `auto` on one card),
 plus a `--expert-cache-device1..3` per helper card. The explicit `6` above is this rig's 32 GB / 16 GB-primary
-optimum; a smaller PC gets a smaller pin. The `--memory-guard` is opt-in - see `docs/TUNING.md` section 1b. See
+optimum; a smaller PC gets a smaller pin. Setup also writes `--prefill auto:16384` at 32 GB of RAM or more (see
+above). The `--memory-guard` is opt-in - see `docs/TUNING.md` section 1b. See
 `docs/TUNING.md` for how to choose these numbers for a different machine.
 
 ### 4.1 The tuned layout
@@ -265,6 +275,13 @@ processes' dirty pages to that disk and every hard fault is a seek. The engine c
 own footprint is **clean, file-backed** memory (the mapped experts, the mapped weights) that the OS can drop without a
 page-file write and re-read from the model's SSD on demand. `--memory-guard` (alias `--windows-memory-guard`) lets
 RAM fill, then makes the **engine** the cheapest victim instead of paging *your* apps out.
+
+> **Not part of the recommended layout (engine 0.1.40).** A fresh cold 32K/5K run on the reference rig
+> (IQ3_XXS, `--host-budget-gib 4`, the CUDA1 helper) decoded at ~41 tok/s with the guard **off** and
+> ~16-25 with it **on** (single runs, high variance; the guard's working-set trim and `VERY_LOW` priority
+> evict the COLD expert pages decode re-reads).  Prefill was unaffected (~640 tok/s either way).  Use the
+> guard only when the page file is on a slow disk and the desktop stutters, and let `tune_cascade.py
+> --guard` decide - it keeps the flag only when it costs no throughput.
 
 **Windows** does the full yield: it watches a free-RAM target (`STRATA_MEM_GUARD_KEEP_FREE_MIB`, default 1024) and the
 OS's own low/high memory notifications (an optional predictive decline trigger, `STRATA_MEM_GUARD_PREDICT=1`, is off by

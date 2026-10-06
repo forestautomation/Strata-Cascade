@@ -53,6 +53,10 @@ class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hp
 class RemoteExperts;
 struct LoadStats;
 
+/// STRATA_PREFILL_TIMING: one line on where the tiered source's streamed reads went - the direct unbuffered read
+/// (and its bytes/time), the mapped-file fallback memcpy, and pinned-RAM memcpy.  Defined in tiered_source.cpp.
+std::string tiered_read_report();
+
 namespace detail {
 
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.

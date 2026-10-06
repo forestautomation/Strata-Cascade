@@ -31,6 +31,12 @@ struct PrefillStats {
     int64_t chunks = 0;
     double ms_total = 0;
     double ms_experts_host = 0;     ///< host time staging non-resident experts
+    // STRATA_PREFILL_TIMING: where that staging time goes (the streamed walk's host pipeline)
+    double ms_iss_stager = 0;       ///< issuer blocked in Stager::wait (the read chain is behind)
+    double ms_iss_enq = 0;          ///< issuer enqueueing the copy (copy-stream wait + memcpyAsync + record)
+    double ms_launch_issued = 0;    ///< launcher blocked in wait_issued (waiting for the issuer)
+    double ms_stager_dmasync = 0;   ///< stager threads blocked on a slot's DMA (summed over threads)
+    double ms_stager_read = 0;      ///< stager threads doing the read/copy (summed over threads)
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier

@@ -57,6 +57,11 @@ the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./
 start the model directly; `./setup.sh --setup` installs another model or changes the settings. Other distributions,
 WSL and compiling: [details](DETAILS.md#linux).
 
+On **WSL**, setup detects it and keeps KV streaming off (the driver pins only ~1 GB of RAM there); it stays off the
+cascade for the same reason and uses upstream's low-RAM mode instead (`--resident-experts`, else `--mmap-experts`).
+An existing cascade config is rewritten that way on its next start. Native Linux or Windows is recommended for the
+cascade itself.
+
 ## AMD cards
 
 The steps are the same as with NVIDIA: `START-HERE.bat` on Windows, `./setup.sh` on Linux. Setup finds the Radeon

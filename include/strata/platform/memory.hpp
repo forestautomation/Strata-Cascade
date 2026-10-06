@@ -88,9 +88,12 @@ struct MemoryGuardConfig {
     MemGuardTrim trim = MemGuardTrim::Soft;  ///< Windows-only trim mode; see MemGuardTrim (ignored on Linux)
     bool priority = true;             ///< Windows-only: lower this process's memory priority on pressure
     bool notify = true;               ///< Windows-only: also use the OS low/high memory notification as a trigger
-    bool predictive = true;           ///< start trimming early when free RAM is falling fast
+    bool predictive = false;          ///< opt-in (`STRATA_MEM_GUARD_PREDICT=1`): start trimming early when free RAM
+                                      ///< is falling fast.  Off by default: the reactive floors plus the OS's own
+                                      ///< low-memory notification are enough, and a hand-tuned slope/band over-trimmed
+                                      ///< on a loaded PC (a wide band pulsed the guard on every transient dip).
     double predict_slope_mib_s = 128.0; ///< a free-RAM decline this fast (MiB/s) counts as "falling fast"
-    uint64_t predict_band_mib = 2048;   ///< ... within this much of keep_free
+    uint64_t predict_band_mib = 512;    ///< ... within this much of keep_free; used only when `predictive`
     bool verbose = false;             ///< log every sample, not only the transitions
     bool stats = false;               ///< log the monitor thread's own CPU periodically
 };

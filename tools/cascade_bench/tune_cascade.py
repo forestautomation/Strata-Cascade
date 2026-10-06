@@ -52,9 +52,9 @@ MIN_VRAM_GIB = 12.0
 # ("The memory guard") and docs/TUNING.md section 1b.
 GUARD_ENV = {
     "STRATA_MEM_GUARD_KEEP_FREE_MIB": "1024",   # free-RAM target to hold
-    "STRATA_MEM_GUARD_RECOVER_MIB": "1024",     # release/clear this far above keep_free (must be >= the band)
+    "STRATA_MEM_GUARD_RECOVER_MIB": "1024",     # release/clear this far above keep_free
     "STRATA_MEM_GUARD_RELEASE_MIB": "256",      # smallest release once the guard acts
-    "STRATA_MEM_GUARD_PREDICT_BAND_MIB": "512", # start early this close to keep_free, on a fast decline
+    "STRATA_MEM_GUARD_PREDICT": "0",            # keep the opt-in early trigger off (the shipped default)
     "STRATA_MEM_GUARD_MIN_MIB": "512",          # free-RAM floor that also counts as pressure
     "STRATA_MEM_GUARD_EMERGENCY_MIB": "256",    # below this (or once the OS says low), release hard
     "STRATA_MEM_GUARD_COMMIT_MIB": "2048",      # available-commit floor
@@ -78,6 +78,18 @@ def apply_guard_env(cfg, on):
 
 def log(msg):
     print(msg, flush=True)
+
+
+def in_wsl() -> bool:
+    """Linux under WSL (Windows Subsystem for Linux): /proc/version says "microsoft".  The cascade cannot run there -
+    its PINNED tier needs the driver to page-lock several GiB, and the WSL driver pins only about 1 GB - so the tuner
+    refuses instead of starting engines that will fail at the first adaptive refill."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        return False
 
 
 def load_config(path):
@@ -477,6 +489,12 @@ def main():
                          "--windows-memory-guard always works and is dropped first)")
     args = ap.parse_args()
 
+    if in_wsl():
+        log("ERROR: the cascade cannot run under WSL: its PINNED tier needs the driver to page-lock several GiB, and"
+            " the WSL driver pins only about 1 GB, so the adaptive refill fails at the first prompt.")
+        log("       Use native Windows/Linux, or upstream's low-RAM mode on one card (--low-ram resident).")
+        return 2
+
     cfg_path = Path(args.config)
     if not cfg_path.is_absolute():
         cfg_path = (ROOT / cfg_path) if (ROOT / cfg_path).exists() else (HERE / cfg_path)
@@ -734,9 +752,9 @@ def main():
         log("  memory guard: %s%s" % ("on" if guard_helps else "off",
             "" if guard_helps else " (the A/B measured a decode cost on this machine)"))
         if guard_helps:
-            log("  guard knobs: keep %s / recover %s / release %s / band %s MiB  (written to the config)"
+            log("  guard knobs: keep %s / recover %s / release %s MiB  (written to the config)"
                 % (GUARD_ENV["STRATA_MEM_GUARD_KEEP_FREE_MIB"], GUARD_ENV["STRATA_MEM_GUARD_RECOVER_MIB"],
-                   GUARD_ENV["STRATA_MEM_GUARD_RELEASE_MIB"], GUARD_ENV["STRATA_MEM_GUARD_PREDICT_BAND_MIB"]))
+                   GUARD_ENV["STRATA_MEM_GUARD_RELEASE_MIB"]))
     if any(r.get("oom") for r in rows):
         log("  note: at least one layout ran out of memory in prefill - see the CSV's oom column")
     log("  CSV   : %s" % csv_path)

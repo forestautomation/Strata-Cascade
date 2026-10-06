@@ -80,7 +80,8 @@ The knobs:
 - `STRATA_MEM_GUARD_KEEP_FREE_MIB` (1024) - the free-RAM target the guard holds; the release lifts free RAM to
   `keep + recover` and then stops. Raise it to keep more RAM free for other apps.
 - `STRATA_MEM_GUARD_RECOVER_MIB` (1024) - how far above `keep_free` the release aims, and where the guard clears.
-  It must be at least the predictive band, or the guard would enter and immediately recover.
+  With the predictive trigger on, it must be at least the predictive band, or the guard would enter and immediately
+  recover.
 - `STRATA_MEM_GUARD_RELEASE_MIB` (256) - the smallest single release once the guard acts.
 - `STRATA_MEM_GUARD_MIN_MIB` (512) - the fallback free-RAM floor that also counts as pressure.
 - `STRATA_MEM_GUARD_EMERGENCY_MIB` (256) - the cliff floor; a genuine cliff releases hard even in `soft` mode.
@@ -88,10 +89,13 @@ The knobs:
 - `STRATA_MEM_GUARD_POLL_MS` (500) - the sample interval.
 - `STRATA_MEM_GUARD_RETRIM_MS` (3000) - the hard re-trim rate.
 - `STRATA_MEM_GUARD_COOLDOWN_MS` (2000) - the settle time after a recovery.
-- `STRATA_MEM_GUARD_PREDICT_SLOPE` (128 MiB/s) / `STRATA_MEM_GUARD_PREDICT_BAND_MIB` (512) - the early trigger: a
-  free-RAM decline this fast within the band starts the release, and the band is deliberately narrow so the entry sits
-  just above `keep_free`, not 2 GiB above it.
-- Toggles: `STRATA_MEM_GUARD_PREDICT=0`, `STRATA_MEM_GUARD_PRIORITY=0`, `STRATA_MEM_GUARD_NOTIFY=0` (Windows),
+- `STRATA_MEM_GUARD_PREDICT_SLOPE` (128 MiB/s) / `STRATA_MEM_GUARD_PREDICT_BAND_MIB` (512) - the **opt-in** early
+  trigger (`STRATA_MEM_GUARD_PREDICT=1`): a free-RAM decline this fast within the band starts the release. Off by
+  default - the reactive floors below plus the OS's own low-memory notification are enough, and a hand-tuned
+  slope/band over-trimmed on a loaded PC (a wide band pulsed the guard on every transient dip). When on, the band is
+  deliberately narrow so the entry sits just above `keep_free`, not 2 GiB above it.
+- Toggles: `STRATA_MEM_GUARD_PREDICT=1` (opt in to the predictive trigger; off by default),
+  `STRATA_MEM_GUARD_PRIORITY=0`, `STRATA_MEM_GUARD_NOTIFY=0` (Windows),
   `STRATA_MEM_GUARD_VERBOSE=1`, `STRATA_MEM_GUARD_STATS=1`.
 
 Test it with `tools/cascade_bench/guard/` (Windows-only harness) - `guard-test.ps1` runs the engine with the guard
@@ -200,7 +204,9 @@ IQ3_XXS, IQ3_S and the Coder model.
 
 **It handles 1-4 GPUs.** The first card is the primary (CUDA0); every card after it becomes a helper
 (`--expert-cache-device1..3`), each sized from that card's own VRAM. A single-GPU machine just skips the helper
-sweep.
+sweep. Because those cards are helper caches and not pipeline stages, a cascade config carries `layer_split: null` -
+setup writes it that way (and repairs an older config on the next start): the engine refuses a layer split beside a
+helper when no GPU is left over.
 
 ### 3.1 Files it writes
 
@@ -254,3 +260,9 @@ Windows numbers so far: see [`../STRATA-CASCADE.md`](../STRATA-CASCADE.md).
 - **Mixed AMD + NVIDIA in one run is not supported** by upstream (`docs/AMD_HIP.md`), so a helper across an
   AMD card and an NVIDIA card is out of scope for the cascade too.
 - **Linux:** the port's Linux path is implemented but not measured. Report if you run it.
+- **WSL is not a supported cascade platform.** The PINNED tier needs the driver to page-lock several GiB, and under
+  WSL (like KV streaming, see [DETAILS.md](DETAILS.md#linux)) the NVIDIA driver pins only about 1 GB; the adaptive
+  tier's refill then fails at the first prompt (`an adaptive refill failed`). Setup warns if you choose
+  `--low-ram tiered` under WSL. Use native Windows/Linux, or upstream's `--low-ram resident` on one card.
+  The tuner refuses on WSL (`tune_cascade.py` / `tune-cascade.sh` exit with that reason), and setup rewrites an
+  existing cascade config to upstream's low-RAM mode on its next start.

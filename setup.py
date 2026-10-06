@@ -913,6 +913,14 @@ def recommend_remote_expert_opt(cfg: dict, off: bool = False) -> None:
            "--no-remote-expert-opt leaves it out)")
 
 
+def cascade_split_off(args) -> bool:
+    """A cascade config never uses a layer split: its cards after the first are CUDA1..3 helper caches, not pipeline
+    stages.  The engine refuses a layer split beside a helper when no GPU is left over ("--expert-cache-remote with a
+    layer split needs a GPU that runs no stage", src/program/generate.cpp), so setup must write a NULL "layer_split" -
+    server.py's engine_args keeps every GPU visible and adds no --layer-split."""
+    return "--tiered-experts" in args and any(str(x).startswith("--expert-cache-device") for x in args)
+
+
 def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
     """Starting a model set up for one card on a PC with two or more that can share it: asked once (the answer is
     saved in its config)."""
@@ -2416,9 +2424,13 @@ def tiered_should_default(model, ram, found) -> bool:
     """True when the ported engine should default to --tiered-experts: the model's experts do not fit RAM (the same
     test that picks the low-RAM mode) AND the PC has a second usable GPU to hold a helper cache.
 
+    Never under WSL: the cascade's PINNED tier page-locks several GiB, and the WSL driver pins only about 1 GB (the
+    same limit that turns KV streaming off), so the adaptive refill fails at the first prompt.  Upstream's low-RAM
+    mode is used there instead.
+
     It looks at the cards setup DETECTED, not the ones chosen: the low-RAM recommendation deliberately picks one GPU
     for the resident variant, and the cascade's win over that is exactly turning the second card into a helper."""
-    if not low_ram_needed(model, ram):
+    if is_wsl() or not low_ram_needed(model, ram):
         return False
     return len(together_ok(found or [])) >= 2
 
@@ -3169,10 +3181,60 @@ def tune_cascade_config(cfg_path: Path, cfg: dict, free_gib: float, helper_gibs:
     return True
 
 
+def wsl_cascade_to_low_ram(cfg: dict, args: list) -> bool:
+    """Rewrite a Strata-Cascade config for WSL: strip the cascade's flags and use upstream's low-RAM mode instead.
+
+    WSL's driver pins only about 1 GB of host RAM, so the cascade's PINNED tier cannot be page-locked and the adaptive
+    refill fails at the first prompt (docs/DETAILS.md, the WSL note).  The replacement is upstream's own rule:
+    --resident-experts when the RAM holds the experts the GPU does not, else --mmap-experts (the mapped multi-GPU
+    path when several cards are visible).  `args` is `cfg["args"]`, mutated in place; returns True when it changed."""
+    model = next((m for m in MODELS if str(cfg.get("model_name", "")).lower().endswith("-" + m.lower())), None)
+    ctx = 32768
+    if "--max-context" in args:
+        try:
+            ctx = int(args[args.index("--max-context") + 1])
+        except (IndexError, ValueError):
+            pass
+    kv = args[args.index("--kv") + 1] if "--kv" in args and args.index("--kv") + 1 < len(args) else "int8"
+    gpus = cfg.get("gpu")
+    gpus = gpus if isinstance(gpus, list) else ([gpus] if gpus is not None else [])
+    primary = gpu_info(gpus[0]) if gpus else gpu_info()
+    vram = float(primary.get("vram_gb", 0.0)) if primary else 0.0
+    resident = model is not None and low_ram_resident(model, ram_gb(), vram, ctx, kv)
+    # strip the cascade's flags: --tiered-experts (bare) and --host-budget-gib/--host-reserve-gib/--expert-cache-deviceN
+    out, i = [], 0
+    while i < len(args):
+        f = args[i]
+        if f == "--tiered-experts":
+            i += 1
+            continue
+        if f in ("--host-budget-gib", "--host-reserve-gib") or f.startswith("--expert-cache-device"):
+            i += 1
+            if i < len(args) and not args[i].startswith("--"):
+                i += 1
+            continue
+        out.append(f)
+        i += 1
+    if "--resident-experts" not in out and "--mmap-experts" not in out:
+        out.append("--resident-experts" if resident else "--mmap-experts")
+    args[:] = out
+    if resident:
+        # upstream's resident low-RAM variant runs on one card (the engine has no layer split for it)
+        cfg["gpu"] = primary["index"] if primary else (gpus[0] if gpus else 0)
+        cfg["layer_split"] = None
+    elif len(gpus) > 1:
+        cfg["layer_split"] = cfg.get("layer_split") or "auto"      # upstream's mapped multi-GPU path
+    warn("WSL: this model was set up with the cascade, which cannot page-lock its PINNED RAM here; using upstream's "
+         "low-RAM mode instead (" + ("resident, on one card" if resident else
+                                     "mmap" + (" across %d GPUs" % len(gpus) if len(gpus) > 1 else "")) + ")")
+    return True
+
+
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     """Configs written before v0.1.13 read prompts in fixed 2048-token chunks; the engine now picks the chunk
     itself (`--prefill auto`: up to 8192, as the free VRAM allows - about 2x faster on long prompts).  Under WSL,
-    KV streaming is dropped: its RAM copy must be pinned, and the driver pins only about 1 GB there."""
+    KV streaming is dropped and a cascade config becomes upstream's low-RAM mode: both need to page-lock host RAM,
+    and the driver pins only about 1 GB there."""
     a = cfg.get("args", [])
     changed = False
     ver = engine_version(cfg["exe"]) if "--prefill" in a else (0, 0, 0)
@@ -3184,6 +3246,16 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
         a[a.index("--prefill") + 1] = "2048"           # an older engine kept after a failed update (issue #49)
         changed = True
         warn(f"the installed engine is {'.'.join(map(str, ver))}: prompts are read in 2048-token chunks until it is updated")
+    if is_wsl() and "--tiered-experts" in a:            # the cascade cannot page-lock its PINNED tier under WSL
+        if wsl_cascade_to_low_ram(cfg, a):
+            changed = True
+    # A config written before the cascade got this rule may carry BOTH a helper cache and a layer split, which the
+    # engine refuses at start.  Heal it here so an existing install does not need to be set up again by hand.
+    split = cfg.get("layer_split")
+    if (split is not None and str(split).strip().lower() not in ("", "none", "off") and cascade_split_off(a)):
+        cfg["layer_split"] = None
+        changed = True
+        ok("cascade: removed the layer split (the extra cards are helper expert caches, not pipeline stages)")
     if is_wsl() and "--kv-resident" in a:
         i = a.index("--kv-resident")
         del a[i:i + 2]
@@ -3289,7 +3361,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
                 fail("the installed engine has no code for " + ", ".join(f"{x['name']} ({x['arch']})" for x in miss),
                      "set it up for these cards: ./setup.sh --setup --backend hip --gpus " + ",".join(map(str, gpu)))
             cfg["gpu"], cfg["gpus_asked"] = gpu, True
-            cfg["layer_split"] = layer_split or cfg.get("layer_split") or "auto"
+            cfg["layer_split"] = (None if cascade_split_off(cfg.get("args", []))
+                                  else layer_split or cfg.get("layer_split") or "auto")
             split_budget(cfg)                          # #498: before it is saved (it stops when the RAM is short)
             write_config(cfg_path, cfg)
             gpu = None
@@ -3317,7 +3390,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     elif isinstance(gpu, list):                        # --gpus: saved, this model runs on these cards from now on
         check_gpus(gpu, found, yes=yes, named=True)
         cfg["gpu"], cfg["gpus_asked"] = gpu, True
-        cfg["layer_split"] = layer_split or cfg.get("layer_split") or "auto"
+        cfg["layer_split"] = (None if cascade_split_off(cfg.get("args", []))
+                              else layer_split or cfg.get("layer_split") or "auto")
         split_budget(cfg)                              # #498: before it is saved (it stops when the RAM is short)
         recommend_remote_expert_opt(cfg)
         write_config(cfg_path, cfg)
@@ -3827,6 +3901,13 @@ def main() -> int:
             a.gpu = int(a.gpu)
         else:
             ap.error(f"--gpu takes a GPU number as nvidia-smi numbers them, e.g. --gpu 1 (or --gpus 0,2), not {a.gpu!r}")
+    if a.low_ram == "tiered" and is_wsl():
+        # The cascade's PINNED tier page-locks several GiB; the WSL driver pins only about 1 GB (the same limit that
+        # turns KV streaming off), so the adaptive refill fails at the first prompt.  Treat the request as `auto` and
+        # let the usual low-RAM logic pick resident (when it fits) or mmap.
+        warn("--low-ram tiered: the cascade cannot page-lock its PINNED RAM under WSL (the driver pins only about "
+             "1 GB); using the usual low-RAM mode instead (resident when it fits, else mmap).")
+        a.low_ram = "auto"
     say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
@@ -4342,7 +4423,7 @@ def main() -> int:
             multi, gpu = sel, chosen[0]
         ok("cascade: this PC's RAM does not hold the model and it has a second GPU, so the experts are spread across "
            "VRAM, a pinned RAM budget and the SSD (Strata-Cascade). Turn it off with --low-ram resident")
-    elif not tiered and ported and a.low_ram == "auto" and low_ram and not multi:
+    elif not tiered and ported and a.low_ram == "auto" and low_ram and not multi and not is_wsl():
         # One card, RAM too small: ask, and recommend the cascade.  This fork IS the cascade fork, so the default
         # here is y: its measured one-card win is prefill (~2x, ~960 vs 434 t/s) while decode is about the same, and
         # its *pinned* RAM budget holds steady where the resident mode's decode depends on the OS file cache staying
@@ -4465,6 +4546,10 @@ def main() -> int:
     if low_ram:   # the experts from the pack's experts.bin: the ones the GPU does not hold copied into RAM, or mapped
         if tiered:
             # the cascading source: a pinned RAM budget + a helper cache on every card after the first
+            if is_wsl():
+                warn("the cascade under WSL is not measured and its PINNED tier needs page-locking, which the WSL "
+                     "driver limits to about 1 GB (the same limit that turns KV streaming off here): the adaptive "
+                     "refill can fail at the first prompt. Use native Windows/Linux, or --low-ram resident on one card")
             helpers = tiered_helper_counts(model, chosen)
             primary_gib = chosen[0]["vram_gb"] if chosen else None
             cascade_budget = cascade_host_budget(helpers, avail_gb=ram_avail, primary_gib=primary_gib)
@@ -4582,10 +4667,17 @@ def main() -> int:
     if gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
         cfg["gpus_asked"] = True                       # chosen at setup: not asked again at start
-    if multi:                                          # a layer split across these cards (the server adds the flag)
+    if multi:                                          # several GPUs: a layer split, or the cascade's helper caches
         cfg["gpu"] = multi
-        cfg["layer_split"] = a.layer_split or "auto"
-        ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
+        if tiered:
+            # The cascade's extra cards are CUDA1..3 helper caches, not pipeline stages: the engine refuses a layer
+            # split beside a helper when no GPU is left over (src/program/generate.cpp), so keep every GPU visible
+            # with a NULL split (serve/server.py's engine_args adds no --layer-split).
+            cfg["layer_split"] = None
+            ok(f"cascade: runs on GPUs {multi} with the extra card(s) as helper expert caches (no layer split)")
+        else:
+            cfg["layer_split"] = a.layer_split or "auto"
+            ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
         recommend_remote_expert_opt(cfg, off=a.no_remote_expert_opt)
     if a.host:
         cfg["host"] = a.host
@@ -4642,7 +4734,11 @@ def main() -> int:
             tuned_cascade = tune_cascade_config(
                 cfg_path, cfg, ram - 3, [g.get("vram_gb", 0.0) * 0.82 for g in chosen[1:4]])
     elif a.tune_cascade:
-        warn("--tune-cascade: this PC or model is not using the cascade (no --tiered-experts), so there is nothing to tune")
+        if is_wsl():
+            warn("--tune-cascade: the cascade is not used under WSL (its PINNED tier cannot page-lock there), so "
+                 "there is nothing to tune; the model runs upstream's low-RAM mode")
+        else:
+            warn("--tune-cascade: this PC or model is not using the cascade (no --tiered-experts), so there is nothing to tune")
     ok(f"start script: {script.name}")
 
     say()

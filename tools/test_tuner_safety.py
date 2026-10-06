@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 import sys
 import tempfile
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cascade_bench"))
 import tune_cascade as tune
@@ -112,6 +113,20 @@ class EndToEndRowFlagging(unittest.TestCase):
             self.assertIsNotNone(tune.oom_reason(p), "the 8 GiB failure must be caught")
         finally:
             Path(p).unlink(missing_ok=True)
+
+
+class WslRefusal(unittest.TestCase):
+    """The cascade cannot page-lock its PINNED tier under WSL, so the tuner refuses before starting any engine."""
+
+    def test_in_wsl_is_false_on_windows(self):
+        if sys.platform.startswith("linux"):
+            self.skipTest("Linux: /proc/version decides")
+        self.assertFalse(tune.in_wsl())
+
+    def test_main_refuses_on_wsl(self):
+        with mock.patch.object(tune, "in_wsl", lambda: True), \
+             mock.patch.object(sys, "argv", ["tune_cascade.py", "--config", "x.json"]):
+            self.assertEqual(tune.main(), 2)
 
 
 if __name__ == "__main__":

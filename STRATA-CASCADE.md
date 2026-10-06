@@ -266,8 +266,9 @@ own footprint is **clean, file-backed** memory (the mapped experts, the mapped w
 page-file write and re-read from the model's SSD on demand. `--memory-guard` (alias `--windows-memory-guard`) lets
 RAM fill, then makes the **engine** the cheapest victim instead of paging *your* apps out.
 
-**Windows** does the full yield: it watches a free-RAM target (`STRATA_MEM_GUARD_KEEP_FREE_MIB`, default 1024), the
-OS's own low/high memory notifications, and a predictive decline trend. On pressure it lowers the engine's memory
+**Windows** does the full yield: it watches a free-RAM target (`STRATA_MEM_GUARD_KEEP_FREE_MIB`, default 1024) and the
+OS's own low/high memory notifications (an optional predictive decline trigger, `STRATA_MEM_GUARD_PREDICT=1`, is off by
+default). On pressure it lowers the engine's memory
 priority and pauses cold prefetch, and it releases the deficit with a proportional `soft` working-set ceiling (set to
 `entry_ws - deficit`); it **holds** `VERY_LOW` priority for the whole low period so the OS keeps choosing the engine's
 clean, file-backed pages over another app's dirty ones. `hard` (`EmptyWorkingSet`) and `off` remain. Windows has no

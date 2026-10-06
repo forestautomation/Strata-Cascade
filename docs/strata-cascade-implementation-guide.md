@@ -255,6 +255,9 @@ upstream** when the ported engine is absent, so a rebase only ever has to merge 
   fraction** - an over-large count makes `RemoteExperts::open` refuse to start, it does not clamp). The budget
   comes from `cascade_host_budget(helpers, ram, primary_gib)`: `auto` on one card, else `min(6 GiB, free RAM - the
   8 GiB reserve, ~45% of the primary card)`, floored at 2 GiB (the same rule as the tuner's `sweep_budgets`).
+  With a helper the config's `layer_split` is **null**, not `"auto"`: the extra cards are helper caches, not
+  pipeline stages, and the engine refuses a split beside a helper when no GPU is left over. `cascade_split_off()`
+  detects it, and `upgrade_config()` rewrites the split out of an older config on the next start/update.
 - **Guards:** `split_mmap()` and `offer_together()` return early on a `--tiered-experts` config (the cascade has
   its own layer handling; the resident/mmap rewrites do not apply).
 - **Tests:** `tools/test_setup_tiered.py`, plus `tools/test_setup_golden.py` proves upstream output is unchanged

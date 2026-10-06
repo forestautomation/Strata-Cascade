@@ -417,7 +417,10 @@ Terminal chat: `.venv/bin/python chat.py`.
   `/opt/cuda*`, and does the rest.
 - **WSL** works (Ubuntu 24.04 tested), with one limit: the NVIDIA driver pins only about 1 GB of RAM there, so KV
   streaming (`--kv-resident`) is off and the KV cache stays in VRAM, and the experts are copied to the GPU from
-  unpinned RAM (slower prompts than native Linux).
+  unpinned RAM (slower prompts than native Linux). For the same reason **Strata-Cascade is not used on WSL**: its
+  PINNED tier needs several GiB page-locked, so setup detects WSL and uses upstream's low-RAM mode instead
+  (`--resident-experts`, or `--mmap-experts` when the RAM does not hold the experts the GPU misses); an existing
+  cascade config is rewritten that way on its next start.
 
 ---
 

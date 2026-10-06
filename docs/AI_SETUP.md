@@ -120,6 +120,10 @@ Notes:
   One card per model and no images on Windows for now. It is new: ask the user to report how it runs (docs/AMD_HIP.md).
 - **NVIDIA with no ready-made engine for the card:** setup offers to install build tools and compile (20-40 minutes);
   `--yes` accepts.
+- **WSL:** setup detects it and never uses the cascade (its PINNED tier needs page-locking the WSL driver caps at
+  ~1 GB); it writes upstream's low-RAM mode instead (`--resident-experts`, else `--mmap-experts`). Do not pass
+  `--low-ram tiered` on WSL, and do not run the cascade tuner there - native Linux or Windows is where the cascade
+  works.
 
 ## 5. While it downloads, tell the user
 

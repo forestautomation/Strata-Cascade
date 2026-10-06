@@ -59,6 +59,12 @@ class ShouldDefault(unittest.TestCase):
     def test_enough_ram_does_not(self):
         self.assertFalse(setup.tiered_should_default("IQ3_XXS", 256, [self.card(0, 16.0), self.card(1, 12.0, "86")]))
 
+    def test_wsl_never_defaults_to_tiered(self):
+        # WSL cannot page-lock the PINNED tier, so the cascade is never the automatic choice there
+        with mock.patch.object(setup, "is_wsl", lambda: True):
+            self.assertFalse(setup.tiered_should_default("IQ3_XXS", 32,
+                                                         [self.card(0, 16.0), self.card(1, 12.0, "86")]))
+
 
 class HelperCounts(unittest.TestCase):
     def test_one_count_per_card_after_the_first(self):
@@ -143,6 +149,62 @@ class Guards(unittest.TestCase):
         self.assertEqual(cfg["args"], ["--mmap-experts"])
 
 
+class NoLayerSplit(unittest.TestCase):
+    """A cascade config must carry layer_split: null (the extra cards are helper caches).  The engine refuses a layer
+    split beside a helper when no GPU is left over - the bug that made a fresh 2-GPU install fail at start."""
+
+    def test_detection(self):
+        self.assertTrue(setup.cascade_split_off(["--tiered-experts", "--expert-cache-device1", "5000"]))
+        self.assertTrue(setup.cascade_split_off(["--tiered-experts", "--expert-cache-device2", "5000"]))
+        self.assertFalse(setup.cascade_split_off(["--tiered-experts"]))               # one card: no helper, no split
+        self.assertFalse(setup.cascade_split_off(["--expert-cache-device1", "5000"]))  # a plain helper, no cascade
+
+    def test_upgrade_removes_a_split_from_an_old_cascade_config(self):
+        cfg = {"gpu": [0, 1], "layer_split": "auto",
+               "args": ["--tiered-experts", "--expert-cache-device1", "5000"]}
+        with mock.patch.object(setup, "write_config", lambda *a, **k: None), \
+             mock.patch.object(setup, "is_wsl", lambda: False):
+            out = setup.upgrade_config(Path("strata-iq3_xxs.json"), cfg)
+        self.assertIsNone(out["layer_split"])
+
+    def test_upgrade_keeps_a_non_cascade_split(self):
+        cfg = {"gpu": [0, 1], "layer_split": "auto", "args": ["--resident-experts"]}
+        with mock.patch.object(setup, "write_config", lambda *a, **k: None), \
+             mock.patch.object(setup, "is_wsl", lambda: False):
+            out = setup.upgrade_config(Path("strata-iq3_xxs.json"), cfg)
+        self.assertEqual(out["layer_split"], "auto")
+
+    def test_wsl_start_converts_a_cascade_config(self):
+        cfg = {"model_name": "qwen3.8-flash-next-iq3_xxs", "gpu": [0, 1], "layer_split": None,
+               "args": ["--native", "x-IQ3_XXS-00001-of-00002.gguf", "--max-context", "65536", "--kv", "int8",
+                        "--tiered-experts", "--host-budget-gib", "6", "--expert-cache-device1", "5000"]}
+        card = {"index": 0, "name": "RTX", "vram_gb": 16.0, "arch": "120", "driver": "1"}
+        with mock.patch.object(setup, "write_config", lambda *a, **k: None), \
+             mock.patch.object(setup, "is_wsl", lambda: True), \
+             mock.patch.object(setup, "ram_gb", lambda: 32.0), \
+             mock.patch.object(setup, "gpu_info", lambda i=None: card):
+            out = setup.upgrade_config(Path("strata-iq3_xxs.json"), cfg)
+        self.assertNotIn("--tiered-experts", out["args"])
+        self.assertNotIn("--host-budget-gib", out["args"])
+        self.assertFalse(any(a.startswith("--expert-cache-device") for a in out["args"]))
+        self.assertIn("--mmap-experts", out["args"])        # 32 GB does not hold IQ3_XXS's non-GPU experts
+        self.assertEqual(out["layer_split"], "auto")         # upstream's mapped multi-GPU path
+
+    def test_wsl_conversion_picks_resident_when_ram_fits(self):
+        cfg = {"model_name": "qwen3.8-flash-next-iq3_xxs", "gpu": [0, 1], "layer_split": None,
+               "args": ["--max-context", "32768", "--kv", "int8", "--tiered-experts",
+                        "--host-budget-gib", "6", "--expert-cache-device1", "5000"]}
+        card = {"index": 0, "name": "RTX", "vram_gb": 16.0, "arch": "120", "driver": "1"}
+        with mock.patch.object(setup, "write_config", lambda *a, **k: None), \
+             mock.patch.object(setup, "is_wsl", lambda: True), \
+             mock.patch.object(setup, "ram_gb", lambda: 128.0), \
+             mock.patch.object(setup, "gpu_info", lambda i=None: card):
+            out = setup.upgrade_config(Path("strata-iq3_xxs.json"), cfg)
+        self.assertIn("--resident-experts", out["args"])
+        self.assertEqual(out["gpu"], 0)                      # upstream's resident variant runs on one card
+        self.assertIsNone(out["layer_split"])
+
+
 class EndToEnd(unittest.TestCase):
     """setup.main() on a mocked 32 GB / two-GPU PC: the ported engine gets --tiered-experts, an upstream one does
     not.  Reuses test_setup_golden's harness so the outside effects are mocked (no GPU, no downloads)."""
@@ -157,6 +219,10 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("--host-budget-gib", cfg["args"])
         # a helper cache for the second card is present
         self.assertTrue(any(a.startswith("--expert-cache-device") for a in cfg["args"]))
+        # the cascade never layer-splits: GPU 1 is a helper cache, so layer_split is null (server.py keeps both
+        # visible without adding --layer-split).  Writing "auto" here makes the engine refuse to start.
+        self.assertIsNone(cfg.get("layer_split"))
+        self.assertEqual(cfg["gpu"], [0, 1])
         # never both the cascade and the resident/mmap flags (the engine refuses the pair)
         self.assertNotIn("--resident-experts", cfg["args"])
         self.assertNotIn("--mmap-experts", cfg["args"])
@@ -201,6 +267,33 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(code, 0, out[-3000:])
         self.assertNotIn("--tiered-experts", cfg["args"])
         self.assertIn("needs the Strata-Cascade engine", out)
+
+    def test_wsl_install_uses_upstream_low_ram(self):
+        """WSL cannot page-lock the PINNED tier: even on the ported engine, setup must write upstream's low-RAM mode
+        (resident or mmap) and never offer the cascade."""
+        import tools.test_setup_golden as golden
+        ram, found = golden.PROFILES["32GB-2x24GB"]
+        with mock.patch.object(setup, "tiered_engine", lambda eng: True):
+            code, out, cfg, asked = golden.install(
+                ram, found, golden.argv_for("qwen", "IQ3_XXS"),
+                extra=[mock.patch.object(setup, "is_wsl", lambda: True)])
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertNotIn("--tiered-experts", cfg["args"])
+        self.assertFalse(any(a.startswith("--expert-cache-device") for a in cfg["args"]))
+        self.assertTrue("--resident-experts" in cfg["args"] or "--mmap-experts" in cfg["args"])
+        self.assertFalse(any("Use the cascade on this card" in q for q in asked), asked)
+
+    def test_wsl_explicit_tiered_falls_back(self):
+        import tools.test_setup_golden as golden
+        ram, found = golden.PROFILES["32GB-2x24GB"]
+        with mock.patch.object(setup, "tiered_engine", lambda eng: True):
+            code, out, cfg, asked = golden.install(
+                ram, found, golden.argv_for("qwen", "IQ3_XXS") + ["--low-ram", "tiered"],
+                extra=[mock.patch.object(setup, "is_wsl", lambda: True)])
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertNotIn("--tiered-experts", cfg["args"])
+        self.assertTrue("--resident-experts" in cfg["args"] or "--mmap-experts" in cfg["args"])
+        self.assertIn("cannot page-lock its PINNED RAM under WSL", out)
 
     def test_one_card_low_ram_asks_and_defaults_to_the_cascade(self):
         """One card whose RAM does not hold the model: the wizard asks, recommending the cascade (this fork is the

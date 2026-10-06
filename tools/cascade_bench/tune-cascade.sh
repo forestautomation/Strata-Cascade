@@ -37,6 +37,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# WSL: the cascade cannot page-lock its PINNED tier (the WSL driver pins only ~1 GB), so refuse before starting engines.
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  echo "tune-cascade: the cascade cannot run under WSL (its PINNED tier needs page-locking; the WSL driver pins only" >&2
+  echo "  about 1 GB, so the adaptive refill fails at the first prompt)." >&2
+  echo "  Use native Windows/Linux, or upstream's low-RAM mode on one card (--low-ram resident)." >&2
+  exit 1
+fi
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$(dirname "$here")")"          # tools/cascade_bench -> repo root
 py="$root/.venv/bin/python"

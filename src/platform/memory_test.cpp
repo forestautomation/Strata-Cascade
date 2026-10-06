@@ -50,7 +50,8 @@ int file_cache_keeps_cases() {
 
 // The guard's state machine is pure (`memory_guard_decide`, platform/memory.cpp), so its enter/exit and
 // release sizing are checked here with no GPU, model or memory hog.  Defaults: keep 1024, recover 1024
-// (exit floor 2048), min_avail 512, min_commit 2048, emergency 256, band 512, slope 128, release_min 256.
+// (exit floor 2048), min_avail 512, min_commit 2048, emergency 256, release_min 256; prediction is opt-in
+// (band 512, slope 128 when `predictive` is set).
 int guard_decision_cases() {
     using namespace strata::platform;
     MemoryGuardConfig c;
@@ -60,9 +61,9 @@ int guard_decision_cases() {
     };
     const Case cases[] = {
         {"quiet at 3 GiB free",                       false, 3000, 8000, false, false,   0.0, GuardAction::None,    0,          false},
-        {"predictive at 1.5 GiB free",                false, 1500, 8000, false, false, 500.0, GuardAction::Enter,   2048 - 1500, false},
+        {"predict off: 1.5 GiB free, falling",        false, 1500, 8000, false, false, 500.0, GuardAction::None,    0,          false},
         {"below target at 900 MiB",                   false,  900, 8000, false, false,   0.0, GuardAction::Enter,   2048 - 900,  false},
-        {"predictive entry does not recover at 1.5 GiB", true, 1500, 8000, false, false, 500.0, GuardAction::Stay,  2048 - 1500, false},
+        {"low at 1.5 GiB does not recover",           true, 1500, 8000, false, false, 500.0, GuardAction::Stay,  2048 - 1500, false},
         {"below target while low",                    true,   1100, 8000, false, false,   0.0, GuardAction::Stay,    2048 - 1100, false},
         {"recover above the exit floor",              true,   2500, 8000, false, false,   0.0, GuardAction::Recover, 0,          false},
         {"stay: OS still signals low at 2.5 GiB",     true,   2500, 8000, true,  false,   0.0, GuardAction::Stay,    256,        false},
@@ -85,6 +86,25 @@ int guard_decision_cases() {
                         (unsigned long long) k.release, (int) k.emergency);
             fail = 1;
         }
+    }
+    // The predictive trigger is opt-in (`STRATA_MEM_GUARD_PREDICT=1`); these cases pin it and the narrow
+    // 512 MiB band, so the default cannot drift back to a wide band unnoticed.
+    c.predictive = true;
+    struct PCase {
+        const char* what; uint64_t avail; double slope; GuardAction action; uint64_t release;
+    };
+    const PCase pcases[] = {
+        {"predict on: 1.5 GiB free, falling",  1500, 500.0, GuardAction::Enter, 2048 - 1500},
+        {"predict on: 3 GiB free, falling",    3000, 500.0, GuardAction::None,  0},
+    };
+    for (const PCase& k : pcases) {
+        const GuardDecision d = memory_guard_decide(c, false, k.avail, 8000, false, false, k.slope);
+        const char* an = d.action == GuardAction::None ? "none" : d.action == GuardAction::Enter ? "enter"
+                       : d.action == GuardAction::Stay ? "stay" : "recover";
+        const bool ok = d.action == k.action && d.release_mib == k.release;
+        std::printf("guard %-46s -> %-7s release %4llu MiB%s\n", k.what, an,
+                    (unsigned long long) d.release_mib, ok ? "" : "  <-- WRONG");
+        fail |= !ok;
     }
     return fail;
 }

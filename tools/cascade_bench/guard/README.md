@@ -4,8 +4,8 @@ The guard itself - what it does on Windows vs Linux, and the measured numbers - 
 [`../../../STRATA-CASCADE.md`](../../../STRATA-CASCADE.md) ("The memory guard"); the knobs and how to test it are in
 [`../../../docs/TUNING.md`](../../../docs/TUNING.md) section 1b. This folder is the **Windows-only harness** that
 exercises it: it runs the engine under a real workload beside a synthetic memory hog and samples RAM / working-set /
-paging / GPU. The guard is cross-platform (on Linux it only pauses cold prefetch), but this harness is PowerShell and
-Windows-only.
+paging / GPU. The guard is cross-platform (on Linux its only lever is the prefetch pause; on the cascade that pause
+needs `STRATA_PREFETCH_PAUSE_ON_PRESSURE=1`), but this harness is PowerShell and Windows-only.
 
 | File | What |
 | --- | --- |
@@ -68,8 +68,8 @@ On this rig (Windows 11, 32 GB, RTX 5060 Ti + RTX 3060, IQ3_XXS), the best two-c
 | 12 GiB active hog, guard | 805.1 | 32.5 | - |
 
 The no-pressure run is the regression check: the guard costs nothing when RAM is not short (it matches the config
-without the guard within the +/-5% run-to-run spread). Under the 12 GiB active hog the guard pauses cold prefetch while
-the OS reports low memory, and keeps the other app's pages out of the page file. These are single runs on a PC that
+without the guard within the +/-5% run-to-run spread). Under the 12 GiB active hog the guard trims the engine's
+working set while the OS reports low memory, and keeps the other app's pages out of the page file. These are single runs on a PC that
 sits near full - indicative, not precise. The guard itself, and the numbers behind it, are in
 [`../../../STRATA-CASCADE.md`](../../../STRATA-CASCADE.md) ("The memory guard").
 

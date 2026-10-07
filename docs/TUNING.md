@@ -62,15 +62,16 @@ What the guard does on Windows and Linux, and its measured numbers, are in
 knobs and how to test it.
 
 `--memory-guard` (alias `--windows-memory-guard`; env `STRATA_MEMORY_GUARD`, alias `STRATA_WINDOWS_MEMORY_GUARD`) is
-opt-in. On Windows it lowers the engine's memory priority and releases its cheap pages while RAM is short; it pauses
-cold prefetch only on an **emergency cliff** (`avail < STRATA_MEM_GUARD_EMERGENCY_MIB`, default 256), because the
-guard already yields by trimming and prefetched pages are clean and reclaimable. On Linux the guard's only lever is
-the prefetch pause, so there it tracks the whole low state. The release is **proportional to the deficit**: the soft working-set ceiling is set to `entry_ws - deficit`,
+opt-in. On Windows it lowers the engine's memory priority and releases its cheap pages while RAM is short. The
+`--mmap-experts`/`--resident-experts` sources also pause cold prefetch while pressure lasts (the pages they would
+fetch are clean and reclaimable); the **cascade does not by default**, because pausing on every dip collapsed decode
+to ~20 t/s - it pauses only with `STRATA_PREFETCH_PAUSE_ON_PRESSURE=1`. On Linux the guard's only lever is the
+prefetch pause. The release is **proportional to the deficit**: the soft working-set ceiling is set to `entry_ws - deficit`,
 where the deficit is what is missing to reach `keep_free + recover`, so the guard asks for exactly what it needs
 rather than a flat fraction of the target. It **holds** `VERY_LOW` memory priority for the whole low period, so the OS
 keeps choosing the engine's clean, file-backed COLD pages over another app's dirty ones. Three release modes on
 Windows, `STRATA_MEM_GUARD_TRIM`: `soft` (default), `hard` (`EmptyWorkingSet` at every trigger) or `off` (priority
-only; prefetch still pauses on a cliff). The engine's locked footprint (registered experts plus pinned host KV) cannot be trimmed.
+only; the prefetch pause, where the source has one, still applies). The engine's locked footprint (registered experts plus pinned host KV) cannot be trimmed.
 
 > **No per-range drop on Windows.** `OfferVirtualMemory` looks like `madvise(MADV_DONTNEED)` but is not: it is rejected
 > for file mappings (`ERROR_INVALID_PARAMETER`) and, where it does work, it makes the range inaccessible until
@@ -86,7 +87,12 @@ The knobs:
   recover.
 - `STRATA_MEM_GUARD_RELEASE_MIB` (256) - the smallest single release once the guard acts.
 - `STRATA_MEM_GUARD_MIN_MIB` (512) - the fallback free-RAM floor that also counts as pressure.
-- `STRATA_MEM_GUARD_EMERGENCY_MIB` (256) - the cliff floor; a genuine cliff releases hard even in `soft` mode.
+- `STRATA_MEM_GUARD_EMERGENCY_MIB` (256) - the cliff floor; free RAM below it (or the OS low signal within
+  twice it) releases hard even in `soft` mode, with or without `STRATA_MEM_GUARD_NOTIFY`. The hard release is
+  what rescues a real cliff: measured on the reference rig, replacing it with a proportional soft ceiling
+  (`STRATA_MEM_GUARD_EMERGENCY=soft`, experimental) kept free RAM pinned at ~135 MiB and collapsed decode to
+  22.5 t/s (30.8M faults, 371 GB read back) against 50.6 t/s, 11.9M faults and 24.9 GB for the default hard
+  cliff. Keep the default.
 - `STRATA_MEM_GUARD_COMMIT_MIB` (2048) - the available-commit floor.
 - `STRATA_MEM_GUARD_POLL_MS` (500) - the sample interval.
 - `STRATA_MEM_GUARD_RETRIM_MS` (3000) - the hard re-trim rate.
@@ -124,13 +130,14 @@ the ceiling `--prefill auto:N` (N = 16384 or 32768, #282); a bare `auto` tops ou
 `auto:N` only **raises the ceiling**: the engine still picks the largest chunk whose device buffers fit the expert
 cache (they are borrowed from it for the prompt and refilled after), so a short prompt is unaffected and a card that
 cannot afford the chunk falls back to a smaller one. The scan's lend cap can resolve `auto:16384` to less - on this
-rig it picked 15360 - and a forced `--prefill 16384` measured a little faster (~820 vs ~700 t/s prefill on the
-run-strata config); setup writes the ceiling form because it leaves the expert cache room. What it does **not** size is the chunk's **host staging
+rig it picked 15616 - while a forced `--prefill 16384` runs the full chunk and measured faster (852.9 vs 783.9 t/s
+prefill, 32K/5K, guard on); setup writes the ceiling form because it leaves the expert cache room, and the tuner
+tries both. What it does **not** size is the chunk's **host staging
 buffers**, which scale with the chunk - the PLE embedding staging is about `2 x T x n_embd x 4` bytes (~170 MB at
 8192, ~335 MB at 16384) and is page-locked. That is why the choice is gated on RAM: setup writes `--prefill
 auto:16384` at 32 GB of RAM or more, and `auto:32768` stays a tip at 96 GB (it ran ~3x slower at 32 GB, #834 #669).
-The tuner A/Bs `auto` against `auto:16384` on the winning layout and keeps the faster one
-(`tune_cascade.py --prefill-ceilings`, default `auto,auto:16384`; add `auto:32768` on a big-RAM PC).
+The tuner A/Bs `auto`, a forced `16384` and `auto:16384` on the winning layout and keeps the one with the best
+prefill (`tune_cascade.py --prefill-ceilings`, default `auto,16384,auto:16384`; add `auto:32768` on a big-RAM PC).
 
 ---
 
@@ -187,16 +194,18 @@ What it does, in order:
 3. if a second GPU exists, also sweeps 2-3 helper sizes;
 4. loads the model once per layout, runs the 32K/5K bench at the config's own context and KV quant (the measured
    runs use the 131072-token (128K) context with `--kv int8`), records decode / prefill / hit rate / tier split;
-5. with `--guard` (wrappers: `-Guard` / `--guard`), re-runs the **winning layout** once with `--memory-guard` and
-   once without, prints the decode / prefill delta, and keeps the flag in the winning config only if it does not
-   cost throughput - the guard step for the responsive-system option (see section 1b); the two rows land in the CSV
+5. with `--guard` (wrappers: `-Guard` / `--guard`; setup's own tuning - `--tune-cascade` or the offered prompt -
+   passes it too), re-runs the **winning layout** once with `--memory-guard` and once without, prints the decode /
+   prefill delta, and keeps the flag in the winning config unless it costs more than the run-to-run noise (~1 t/s /
+   2% decode) - the guard step for the responsive-system option (see section 1b); the two rows land in the CSV
    with `memory_guard` 1 and 0. Both arms run the shipped knobs (keep 1024 / recover 1024 / release 256 /
    band 512 MiB) through the config's `env`, and those knobs are written into the winning config when the guard is
    kept - the same on Linux and Windows (the Linux guard only pauses cold prefetch, so a near-zero delta is
    expected);
-6. A/Bs the **prompt chunk** on the winning layout - `--prefill auto` vs `auto:16384` (add `auto:32768` with
-   `--prefill-ceilings auto,auto:16384,auto:32768` on a big-RAM PC) - and keeps the faster one in the winning config
-   (section 1c); the rows land in the CSV with a `prefill_ceiling` column;
+6. A/Bs the **prompt chunk** on the winning layout - `--prefill auto` vs a forced `16384` vs `auto:16384` (add
+   `auto:32768` with `--prefill-ceilings auto,16384,auto:16384,auto:32768` on a big-RAM PC) - and keeps the one
+   with the best prefill in the winning config (section 1c); the rows land in the CSV with a `prefill_ceiling`
+   column;
 7. writes `tools/cascade_bench/tune-<date>.csv` and prints the winning layout.
 
 **What it changes, and what it leaves alone.** Each layout starts from your existing `strata-<model>.json` and

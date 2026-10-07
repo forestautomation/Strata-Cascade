@@ -285,13 +285,15 @@ RAM fill, then makes the **engine** the cheapest victim instead of paging *your*
 
 **Windows** does the full yield: it watches a free-RAM target (`STRATA_MEM_GUARD_KEEP_FREE_MIB`, default 1024) and the
 OS's own low/high memory notifications (an optional predictive decline trigger, `STRATA_MEM_GUARD_PREDICT=1`, is off by
-default). On pressure it lowers the engine's memory
-priority and pauses cold prefetch, and it releases the deficit with a proportional `soft` working-set ceiling (set to
-`entry_ws - deficit`); it **holds** `VERY_LOW` priority for the whole low period so the OS keeps choosing the engine's
-clean, file-backed pages over another app's dirty ones. `hard` (`EmptyWorkingSet`) and `off` remain. Windows has no
-per-range drop to call: `OfferVirtualMemory` is rejected for file mappings and, where it works, discards contents and
-blocks access until `ReclaimVirtualMemory` - the original comment in `tiered_source.cpp` was right. **On Linux the same
-flag pauses cold prefetch** (the kernel already reclaims the clean expert pages); the Linux path is **unmeasured**.
+default). On pressure it lowers the engine's memory priority and releases the deficit with a proportional `soft`
+working-set ceiling (set to `entry_ws - deficit`); it **holds** `VERY_LOW` priority for the whole low period so the OS
+keeps choosing the engine's clean, file-backed pages over another app's dirty ones. `hard` (`EmptyWorkingSet`) and `off`
+remain. The `--mmap-experts`/`--resident-experts` sources also pause cold prefetch while pressure lasts; the **cascade
+does not by default** - pausing on every dip collapsed decode to ~20 t/s, so it is gated behind
+`STRATA_PREFETCH_PAUSE_ON_PRESSURE=1`. Windows has no per-range drop to call: `OfferVirtualMemory` is rejected for file
+mappings and, where it works, discards contents and blocks access until `ReclaimVirtualMemory` - the original comment
+in `tiered_source.cpp` was right. **On Linux the guard's only lever is the prefetch pause** (the kernel already
+reclaims the clean expert pages); the Linux path is **unmeasured**.
 Knobs and the harness: [`docs/TUNING.md`](docs/TUNING.md) section 1b.
 
 Measured on Windows 11, 32 GB RAM, RTX 5060 Ti + a helper card, IQ3_XXS, `--tiered-experts --host-budget-gib 4`,

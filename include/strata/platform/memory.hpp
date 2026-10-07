@@ -88,12 +88,22 @@ struct MemoryGuardConfig {
     uint64_t min_avail_mib = 512;     ///< fallback floor: pressure while free physical memory is under this
     uint64_t keep_free_mib = 1024;    ///< the free-RAM target the guard holds; pressure under it
     uint64_t min_commit_mib = 2048;   ///< ... or available commit (RAM + page file) is under this
-    uint64_t emergency_mib = 256;     ///< below this (or once the OS signals low), release hard even in soft mode
+    uint64_t emergency_mib = 256;     ///< below this (or the OS signals low and free RAM is under twice
+                                      ///< this), release hard even in soft mode.  The floor is the driver;
+                                      ///< the OS notification only widens it, so a cliff still releases with
+                                      ///< `notify=0` and off-Windows (there is no notification there).
     uint64_t recover_mib = 1024;      ///< release toward (and clear) this far above `keep_free_mib` (hysteresis)
     uint64_t release_min_mib = 256;   ///< smallest release once the guard acts (keeps a release meaningful)
     int retrim_ms = 3000;             ///< while pressure lasts, act again this often (0 = only on entry)
     int cooldown_ms = 2000;           ///< after recovery, ignore soft pressure this long (emergency still acts)
     MemGuardTrim trim = MemGuardTrim::Soft;  ///< Windows-only trim mode; see MemGuardTrim (ignored on Linux)
+    /// How a genuine cliff (free RAM under `emergency_mib`) releases, in `soft` trim mode.  `Hard`
+    /// (default) is `EmptyWorkingSet`: it looks blunt but is what actually rescues a real cliff - a
+    /// proportional soft ceiling sized from the deficit is far too small off a multi-GiB working set, so
+    /// RAM stays pinned and the OS thrashes the engine (measured: decode 22.5 vs 50.6 t/s, 30.8M vs 11.9M
+    /// faults, 371 GB vs 24.9 GB read back).  `Soft` is kept for experiments only.  Ignored when `trim`
+    /// is `Off` or `Hard` (those already decide).
+    MemGuardTrim emergency_trim = MemGuardTrim::Hard;
     bool priority = true;             ///< Windows-only: lower this process's memory priority on pressure
     bool notify = true;               ///< Windows-only: also use the OS low/high memory notification as a trigger
     bool predictive = false;          ///< opt-in (`STRATA_MEM_GUARD_PREDICT=1`): start trimming early when free RAM
@@ -148,10 +158,13 @@ struct GuardDecision {
     bool emergency = false;     ///< a genuine cliff: release hard even in soft mode
 };
 
-/// `avail_mib`/`commit_mib` are 0 when the sample is unavailable; `os_low` is the OS's own low-memory
-/// notification (always false off-Windows); `in_cooldown` suppresses a new Enter; `slope_mib_s` is the
-/// EWMA free-RAM decline (positive = falling).
+/// `avail_mib` is 0 when the sample is unavailable; `commit_mib` is the available commit and is 0 both
+/// when the sample is unavailable (`have_commit` false) and when commit is genuinely exhausted
+/// (`have_commit` true, a real pressure signal - the old signature could not tell the two apart);
+/// `os_low` is the OS's own low-memory notification (always false off-Windows); `in_cooldown`
+/// suppresses a new Enter; `slope_mib_s` is the EWMA free-RAM decline (positive = falling).
 GuardDecision memory_guard_decide(const MemoryGuardConfig& cfg, bool low, uint64_t avail_mib,
-                                  uint64_t commit_mib, bool os_low, bool in_cooldown, double slope_mib_s);
+                                  uint64_t commit_mib, bool have_commit, bool os_low, bool in_cooldown,
+                                  double slope_mib_s);
 
 }  // namespace strata::platform

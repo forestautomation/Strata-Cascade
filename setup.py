@@ -3272,6 +3272,21 @@ SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", 
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN"})   # the "env" entries setup writes
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
+# The memory guard is opt-in - setup never turns it on - but once a config uses it, setup owns the flag and
+# these shipped knobs: a re-run keeps the flag and fills in any knob the user did not set, instead of dropping
+# the guard with the other hand-added args (see carry_guard_args).  Keep this identical to
+# tools/cascade_bench/tune_cascade.py's GUARD_ENV.
+GUARD_ENV = {
+    "STRATA_MEM_GUARD_KEEP_FREE_MIB": "1024",
+    "STRATA_MEM_GUARD_RECOVER_MIB": "1024",
+    "STRATA_MEM_GUARD_RELEASE_MIB": "256",
+    "STRATA_MEM_GUARD_PREDICT": "0",
+    "STRATA_MEM_GUARD_MIN_MIB": "512",
+    "STRATA_MEM_GUARD_EMERGENCY_MIB": "256",
+    "STRATA_MEM_GUARD_COMMIT_MIB": "2048",
+}
+GUARD_FLAGS = ("--memory-guard", "--windows-memory-guard")
+
 
 def carry_over(old: dict, cfg: dict) -> list[str]:
     """#629: setup run again for an installed model keeps what the user added to its run config: every key setup does
@@ -3300,6 +3315,7 @@ def carry_over(old: dict, cfg: dict) -> list[str]:
             nv["mmproj"] = mm
             kept.append("vision mmproj")
     kept += carry_profile_args(old, cfg)
+    kept += carry_guard_args(old, cfg)
     return kept
 
 
@@ -3328,6 +3344,34 @@ def carry_profile_args(old: dict, cfg: dict) -> list[str]:
     if save and flag_value(nargs, "--expert-profile-save") is None:
         nargs += ["--expert-profile-save", save]
         kept.append("args --expert-profile-save")
+    return kept
+
+
+def carry_guard_args(old: dict, cfg: dict) -> list[str]:
+    """The memory guard is opt-in: setup never turns it on by itself.  But when the earlier config uses it (a
+    hand-added --memory-guard, or the tuner's A/B choice), setup owns the flag and the shipped knobs, so a
+    re-run keeps the flag and fills in any `STRATA_MEM_GUARD_*` knob the user did not set - instead of dropping
+    the guard with the other hand-added engine options.  A knob the user (or the tuner) set keeps its value.
+    The names kept are returned."""
+    oargs = old.get("args") if isinstance(old.get("args"), list) else []
+    nargs = cfg.get("args") if isinstance(cfg.get("args"), list) else None
+    if nargs is None:
+        return []
+    oenv = old.get("env") if isinstance(old.get("env"), dict) else {}
+    on = any(f in oargs for f in GUARD_FLAGS) or str(oenv.get("STRATA_MEMORY_GUARD", "")).strip() not in ("", "0")
+    kept = []
+    if on and not any(f in nargs for f in GUARD_FLAGS):
+        nargs.append("--memory-guard")
+        kept.append("args --memory-guard")
+    if on or any(f in nargs for f in GUARD_FLAGS):
+        env = cfg.get("env")
+        if not isinstance(env, dict):
+            env = {}
+            cfg["env"] = env
+        for k, v in GUARD_ENV.items():                 # the earlier env merge already carried the user's values
+            if k not in env:
+                env[k] = v
+                kept.append("env " + k)
     return kept
 
 
@@ -3596,7 +3640,9 @@ def setup_calibration(cfg: dict, hip: bool) -> dict | None:
 
 
 def tune_cascade_config(cfg_path: Path, cfg: dict, free_gib: float, helper_gibs: list[float]) -> bool:
-    """Sweep a few cascade layouts on the 32K/5K bench (tools/cascade_bench) and adopt the winner.
+    """Sweep a few cascade layouts on the 32K/5K bench (tools/cascade_bench) and adopt the winner.  The tuner
+    also A/Bs the memory guard on the winning layout and the prompt chunk (see tools/cascade_bench/tune_cascade.py),
+    so the guard flag and the `--prefill` ceiling are decided on THIS PC.
 
     Unlike calibrate_config this STARTS the model once per layout, so it is opt-in (--tune-cascade) and slow.  Any
     failure leaves the layout setup wrote in place: tuning never stops an install."""
@@ -3606,10 +3652,10 @@ def tune_cascade_config(cfg_path: Path, cfg: dict, free_gib: float, helper_gibs:
         return False
     say()
     say("  Tuning the cascade layout for this PC: the tuner starts the model once per layout (a few around the")
-    say("  pinned RAM budget and the second GPU's cache) and benches each on a 32K prompt / 5K reply. It takes a")
-    say("  while; the PC is busy meanwhile.")
+    say("  pinned RAM budget and the second GPU's cache), benches each on a 32K prompt / 5K reply, then A/Bs the")
+    say("  memory guard and the prompt chunk on the winner. It takes a while; the PC is busy meanwhile.")
     cmd = [sys.executable, str(tuner), "--config", str(cfg_path), "--python", sys.executable,
-           "--port", str(cfg.get("port") or 8080), "--free-gib", f"{free_gib:.1f}"]
+           "--port", str(cfg.get("port") or 8080), "--free-gib", f"{free_gib:.1f}", "--guard"]
     if helper_gibs:
         cmd += ["--helper-gib", ",".join(f"{g:.2f}" for g in helper_gibs)]
     started = time.time()
@@ -4361,8 +4407,8 @@ def main() -> int:
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--tune-cascade", action="store_true",
-                    help="tune the Strata-Cascade tier layout for this PC (starts the model once per layout; about "
-                         "10-20 minutes), then start the model")
+                    help="tune the Strata-Cascade tier layout for this PC (starts the model once per layout, then "
+                         "A/Bs the memory guard and the prompt chunk; about 10-20 minutes), then start the model")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM, English answers 1-2%% faster), cyrillic = English, code "
@@ -5295,7 +5341,8 @@ def main() -> int:
     if tiered:                                         # the cascade layout depends on this PC's RAM and second GPU
         again = "START-HERE.bat" if WIN else "./setup.sh"
         if a.tune_cascade or (not a.yes and not a.no_start and ask(
-                "Tune the cascade layout for this PC now? It starts the model once per layout (about 10-20 minutes; "
+                "Tune the cascade layout for this PC now? It starts the model once per layout and A/Bs the memory "
+                "guard and the prompt chunk (about 10-20 minutes; "
                 f"the PC is busy meanwhile; later: {again} --tune-cascade)", ["y", "n"], "n", a.yes) == "y"):
             tuned_cascade = tune_cascade_config(
                 cfg_path, cfg, ram - 3, [g.get("vram_gb", 0.0) * 0.82 for g in chosen[1:4]])

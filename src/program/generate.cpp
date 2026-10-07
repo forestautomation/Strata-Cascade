@@ -814,18 +814,23 @@ void usage() {
                  "  --host-reserve-gib N RAM left for the cold tier's page cache and the OS with an auto budget\n"
                  "                       (default 8)\n"
                  "  --memory-guard       opt-in: let RAM fill, then yield on demand.  Watches a free-RAM target\n"
-                 "                       and the OS's own low-memory notification; on pressure pauses cold prefetch and (Windows)\n"
-                 "                       lowers this process's memory priority and trims its cheap file-backed\n"
-                 "                       pages (soft ceiling by default; hard = trim now).  On Linux the priority,\n"
-                 "                       ceiling and notifications are Windows-only, so it only pauses prefetch.\n"
+                 "                       and the OS's own low-memory notification.  Windows: on pressure lowers\n"
+                 "                       this process's memory priority and trims its cheap file-backed pages\n"
+                 "                       (soft ceiling by default; hard = trim now).  Under pressure the mmap and\n"
+                 "                       resident sources pause prefetch; the cascade pauses it only when\n"
+                 "                       STRATA_PREFETCH_PAUSE_ON_PRESSURE=1 (pausing on every dip cost decode).\n"
+                 "                       Linux has no priority/ceiling/notification, so it only pauses prefetch.\n"
                  "                       Alias: --windows-memory-guard.\n"
                  "                       Env: STRATA_MEMORY_GUARD (alias STRATA_WINDOWS_MEMORY_GUARD),\n"
-                 "                       STRATA_MEM_GUARD_KEEP_FREE_MIB (512), STRATA_MEM_GUARD_MIN_MIB (512),\n"
+                 "                       STRATA_MEM_GUARD_KEEP_FREE_MIB (1024), STRATA_MEM_GUARD_MIN_MIB (512),\n"
                  "                       STRATA_MEM_GUARD_EMERGENCY_MIB (256), STRATA_MEM_GUARD_COMMIT_MIB (2048),\n"
+                 "                       STRATA_MEM_GUARD_RECOVER_MIB (1024), STRATA_MEM_GUARD_RELEASE_MIB (256),\n"
                  "                       STRATA_MEM_GUARD_POLL_MS (500), STRATA_MEM_GUARD_RETRIM_MS (3000),\n"
                  "                       STRATA_MEM_GUARD_COOLDOWN_MS (2000), STRATA_MEM_GUARD_TRIM=soft|hard|0,\n"
+                 "                       STRATA_MEM_GUARD_EMERGENCY=soft|hard (cliff release; hard default),\n"
                  "                       STRATA_MEM_GUARD_NOTIFY=0, STRATA_MEM_GUARD_PREDICT=1 (opt-in),\n"
-                 "                       STRATA_MEM_GUARD_PREDICT_SLOPE (128 MiB/s), STRATA_MEM_GUARD_PRIORITY=0,\n"
+                 "                       STRATA_MEM_GUARD_PREDICT_SLOPE (128 MiB/s), PREDICT_BAND_MIB (512),\n"
+                 "                       STRATA_MEM_GUARD_PRIORITY=0,\n"
                  "                       STRATA_MEM_GUARD_VERBOSE=1, STRATA_MEM_GUARD_STATS=1.\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
@@ -1918,6 +1923,11 @@ int main(int argc, char** argv) {
             else if (t == "soft") g.trim = strata::platform::MemGuardTrim::Soft;
             else g.trim = strata::platform::MemGuardTrim::Hard;   // "1"/"hard"/anything truthy (old behaviour)
         }
+        if (const char* v = std::getenv("STRATA_MEM_GUARD_EMERGENCY")) {
+            const std::string t(v);
+            g.emergency_trim = t == "hard" ? strata::platform::MemGuardTrim::Hard
+                                           : strata::platform::MemGuardTrim::Soft;
+        }
         if (const char* v = std::getenv("STRATA_MEM_GUARD_PRIORITY")) g.priority = std::atoi(v) != 0;
         if (const char* v = std::getenv("STRATA_MEM_GUARD_NOTIFY")) g.notify = std::atoi(v) != 0;
         if (const char* v = std::getenv("STRATA_MEM_GUARD_PREDICT")) g.predictive = std::atoi(v) != 0;
@@ -1928,6 +1938,7 @@ int main(int argc, char** argv) {
         const char* trim_name = g.trim == strata::platform::MemGuardTrim::Off   ? "off"
                                 : g.trim == strata::platform::MemGuardTrim::Soft ? "soft"
                                                                                  : "hard";
+        const char* cliff_name = g.emergency_trim == strata::platform::MemGuardTrim::Hard ? "hard" : "soft";
         std::string guard_why;
         if (strata::platform::memory_guard_start(g, guard_why)) {
 #if defined(_WIN32)
@@ -1938,14 +1949,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "strata generate: memory guard on (%s): keep %llu MiB free (floor %llu MiB, emergency %llu MiB), "
                          "hold to %llu MiB, release min %llu MiB, commit floor %llu MiB, poll %d ms, trim %s, "
-                         "priority %s, notify %s, predictive %s\n",
+                         "cliff %s, priority %s, notify %s, predictive %s\n",
                          backend,
                          (unsigned long long) g.keep_free_mib, (unsigned long long) g.min_avail_mib,
                          (unsigned long long) g.emergency_mib,
                          (unsigned long long) (g.keep_free_mib + g.recover_mib),
                          (unsigned long long) g.release_min_mib,
                          (unsigned long long) g.min_commit_mib, g.poll_ms,
-                         trim_name, g.priority ? "on" : "off",
+                         trim_name, cliff_name, g.priority ? "on" : "off",
                          g.notify ? "on" : "off", g.predictive ? "on" : "off");
         } else {
             std::fprintf(stderr, "strata generate: --memory-guard: %s\n", guard_why.c_str());

@@ -147,6 +147,22 @@ class CarryOver(unittest.TestCase):
             same = {"args": ["--expert-profile", "/old/expert-profile.bin"]}
             self.assertEqual(setup.carry_over(same, new), [])
 
+    def test_a_memory_guard_choice_is_carried(self):
+        # the guard is opt-in (setup never turns it on), but when a config uses it the flag and the shipped
+        # knobs survive a setup re-run - like --expert-profile, the one hand-added engine option setup keeps.
+        old = {"args": ["--kv", "int8", "--memory-guard"], "env": {"STRATA_MEM_GUARD_KEEP_FREE_MIB": "2048"}}
+        new = {"args": ["--kv", "int8", "--tiered-experts"], "env": {}}
+        kept = setup.carry_over(old, new)
+        self.assertIn("--memory-guard", new["args"])
+        self.assertIn("args --memory-guard", kept)
+        self.assertEqual(new["env"]["STRATA_MEM_GUARD_KEEP_FREE_MIB"], "2048")   # the user's value stays
+        self.assertEqual(new["env"]["STRATA_MEM_GUARD_RECOVER_MIB"], "1024")     # the rest filled from the shipped set
+        # no guard: setup adds nothing (the opt-in default)
+        old2, new2 = {"args": ["--kv", "int8"]}, {"args": ["--kv", "int8"], "env": {}}
+        self.assertEqual(setup.carry_over(old2, new2), [])
+        self.assertNotIn("--memory-guard", new2["args"])
+        self.assertNotIn("STRATA_MEM_GUARD_KEEP_FREE_MIB", new2["env"])
+
     def test_a_missing_mmproj_is_not_carried(self):
         old = {"vision": {"mmproj": "/nowhere/mmproj-Q8_0.gguf", "gpu": True}}
         new = {"vision": {"mmproj": "/data/mmproj-BF16.gguf", "gpu": True}}

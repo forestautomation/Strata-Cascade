@@ -58,6 +58,7 @@ int guard_decision_cases() {
     struct Case {
         const char* what; bool low; uint64_t avail, commit; bool os_low; bool cooldown; double slope;
         GuardAction action; uint64_t release; bool emergency;
+        bool have_commit = true;   // trailing default: the pre-B2 cases all carry a real commit sample
     };
     const Case cases[] = {
         {"quiet at 3 GiB free",                       false, 3000, 8000, false, false,   0.0, GuardAction::None,    0,          false},
@@ -72,10 +73,23 @@ int guard_decision_cases() {
         {"emergency breaks the cooldown",             false,   200, 8000, true,  true,    0.0, GuardAction::Enter,   2048 - 200, true},
         {"emergency cliff",                           false,   200, 8000, true,  false,   0.0, GuardAction::Enter,   2048 - 200, true},
         {"emergency holds while low",                 true,    200, 8000, true,  false,   0.0, GuardAction::Stay,    2048 - 200, true},
+        // `have_commit` separates an unavailable sample from a genuinely exhausted commit (0 MiB),
+        // which is the worst case and must count as pressure / block recovery.
+        {"commit exhausted (0) acts",                 false, 3000,    0, false, false,   0.0, GuardAction::Enter,   256,        false, true},
+        {"commit unknown is not pressure",            false, 3000,    0, false, false,   0.0, GuardAction::None,    0,          false, false},
+        {"commit exhausted blocks recovery",          true,  3000,    0, false, false,   0.0, GuardAction::Stay,    256,        false, true},
+        {"commit unknown allows recovery",            true,  3000,    0, false, false,   0.0, GuardAction::Recover, 0,          false, false},
+        // The emergency floor itself is the driver, not the OS notification - so it still fires with
+        // `notify=0` and on Linux (`os_low=false`); the OS signal only widens it to 2x the floor.
+        {"emergency cliff without OS signal",         false,  200, 8000, false, false,   0.0, GuardAction::Enter,   2048 - 200, true},
+        {"emergency holds without OS signal",         true,   200, 8000, false, false,   0.0, GuardAction::Stay,    2048 - 200, true},
+        {"OS low widens emergency to 2x floor",       false,  400, 8000, true,  false,   0.0, GuardAction::Enter,   2048 - 400, true},
+        {"OS low above 2x floor is not emergency",    false,  600, 8000, true,  false,   0.0, GuardAction::Enter,   2048 - 600, false},
     };
     int fail = 0;
     for (const Case& k : cases) {
-        const GuardDecision d = memory_guard_decide(c, k.low, k.avail, k.commit, k.os_low, k.cooldown, k.slope);
+        const GuardDecision d = memory_guard_decide(c, k.low, k.avail, k.commit, k.have_commit, k.os_low,
+                                                    k.cooldown, k.slope);
         const char* an = d.action == GuardAction::None ? "none" : d.action == GuardAction::Enter ? "enter"
                        : d.action == GuardAction::Stay ? "stay" : "recover";
         const bool ok = d.action == k.action && d.release_mib == k.release && d.emergency == k.emergency;
@@ -98,7 +112,7 @@ int guard_decision_cases() {
         {"predict on: 3 GiB free, falling",    3000, 500.0, GuardAction::None,  0},
     };
     for (const PCase& k : pcases) {
-        const GuardDecision d = memory_guard_decide(c, false, k.avail, 8000, false, false, k.slope);
+        const GuardDecision d = memory_guard_decide(c, false, k.avail, 8000, true, false, false, k.slope);
         const char* an = d.action == GuardAction::None ? "none" : d.action == GuardAction::Enter ? "enter"
                        : d.action == GuardAction::Stay ? "stay" : "recover";
         const bool ok = d.action == k.action && d.release_mib == k.release;
@@ -108,11 +122,54 @@ int guard_decision_cases() {
     }
     return fail;
 }
+
+// `memory_guard_start` validates/clamps the env-supplied knobs.  The rejection paths return before a
+// thread is created, so they need no GPU; the last case starts and stops a real monitor thread, which is
+// the graceful-stop path the guard harness never exercised (it force-kills the engine).
+int guard_validation_cases() {
+    using namespace strata::platform;
+    int fail = 0;
+    auto rejects = [&](const char* what, const MemoryGuardConfig& cfg) {
+        std::string why;
+        const bool ok = !memory_guard_start(cfg, why);
+        std::printf("guard cfg %-40s -> %s (%s)%s\n", what, ok ? "rejected" : "ACCEPTED", why.c_str(),
+                    ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    };
+    MemoryGuardConfig c;
+    c.keep_free_mib = 0;
+    rejects("keep_free 0", c);
+    c = MemoryGuardConfig{};
+    c.keep_free_mib = ~0ull;                  // what `strtoull("-1")` produces
+    rejects("keep_free -1 (UINT64_MAX)", c);
+    c = MemoryGuardConfig{};
+    c.recover_mib = ~0ull;
+    rejects("recover -1 (UINT64_MAX)", c);
+    c = MemoryGuardConfig{};
+    c.poll_ms = 10;
+    rejects("poll 10 ms", c);
+    c = MemoryGuardConfig{};
+    c.predictive = true;
+    c.predict_band_mib = 4096;                // band above recover = an inverted enter/exit pair
+    rejects("predictive band > recover", c);
+
+    c = MemoryGuardConfig{};
+    std::string why;
+    const bool started = memory_guard_start(c, why);
+    std::printf("guard cfg %-40s -> %s\n", "the defaults", started ? "accepted" : "REFUSED");
+    fail |= !started;
+    if (started) memory_guard_stop();
+    const MemoryGuardStats st = memory_guard_stats();
+    std::printf("guard start/stop: samples=%llu hard=%llu soft=%llu\n", (unsigned long long) st.samples,
+                (unsigned long long) st.hard_trims, (unsigned long long) st.soft_trims);
+    return fail;
+}
 }  // namespace
 
 int main() {
     int fail_keeps = file_cache_keeps_cases();
     const int fail_guard = guard_decision_cases();
+    const int fail_guard_cfg = guard_validation_cases();
     const uint64_t bytes = 256ull << 20;
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
@@ -120,7 +177,7 @@ int main() {
     const strata::platform::LockResult r = strata::platform::lock_resident(p, bytes);
     std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
                 r.note.c_str());
-    int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps | fail_guard;
+    int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps | fail_guard | fail_guard_cfg;
 #if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS pmc{};
     GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);

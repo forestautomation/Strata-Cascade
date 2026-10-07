@@ -296,21 +296,25 @@ void capture_ws_base(SoftCeiling& sc) {
     sc.have_base = true;
 }
 
-void apply_soft_ceiling(SoftCeiling& sc, uint64_t target_ws) {
+bool apply_soft_ceiling(SoftCeiling& sc, uint64_t target_ws) {
     HANDLE self = GetCurrentProcess();
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
-    if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) return;
+    if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) return false;
     if (!sc.have_base) capture_ws_base(sc);
-    sc.active = true;
     // The max is only a hint, so there is no need to bound `want` from above: setting it above the current
     // working set simply means "no ceiling". The locked/pinned pages must never be squeezed, hence the floor.
     const SIZE_T floor = min_ws + (64ull << 20);
     SIZE_T want = (SIZE_T) target_ws;
     if (want < floor) want = floor;
-    SetProcessWorkingSetSizeEx(self, min_ws, want,
-                               QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    // A failed call must not be reported (or counted) as a release.  Only mark the ceiling active and
+    // remember `applied` once the OS accepted it, so the log and `soft_trims` reflect what really happened.
+    if (!SetProcessWorkingSetSizeEx(self, min_ws, want,
+                                    QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+        return false;
+    sc.active = true;
     sc.applied = (uint64_t) want;
+    return true;
 }
 
 void clear_soft_ceiling(SoftCeiling& sc) {
@@ -318,8 +322,14 @@ void clear_soft_ceiling(SoftCeiling& sc) {
     HANDLE self = GetCurrentProcess();
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
-    if (GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags))
-        SetProcessWorkingSetSizeEx(self, min_ws, sc.have_base ? sc.base_max : max_ws, sc.base_flags);
+    if (GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
+        // The base maximum was captured at guard start, before `lock_resident` raised the minimum for the
+        // resident/pinned arena.  Restoring a max below the current min would be rejected (or worse), so
+        // fall back to "no maximum" (`(SIZE_T) -1`) whenever the remembered base is below the min.
+        SIZE_T restore = sc.have_base ? sc.base_max : max_ws;
+        if (restore < min_ws) restore = (SIZE_T) -1;
+        SetProcessWorkingSetSizeEx(self, min_ws, restore, sc.base_flags);
+    }
     sc.active = false;
     sc.applied = 0;
 }
@@ -406,8 +416,7 @@ void guard_loop(GuardState* s) {
         const uint64_t base = sc.base_ws > 0 ? sc.base_ws : working_set_bytes();
         const uint64_t share = want_free < kMaxReleasePerTrim ? want_free : kMaxReleasePerTrim;
         const uint64_t target = base > share ? base - share : 0;
-        apply_soft_ceiling(sc, target);
-        ++soft_trims;
+        if (apply_soft_ceiling(sc, target)) ++soft_trims;   // count only a ceiling the OS accepted
         return sc.applied;
     };
 
@@ -441,6 +450,7 @@ void guard_loop(GuardState* s) {
         const GuardDecision dec = memory_guard_decide(cfg, low,
                                                       have_ms ? (avail >> 20) : 0,
                                                       have_ms ? (commit >> 20) : 0,
+                                                      /*have_commit=*/have_ms,
                                                       notify_low, in_cooldown, slope);
 
         // Release the deficit with the soft working-set ceiling: `target = entry_ws - deficit`, so the
@@ -452,25 +462,29 @@ void guard_loop(GuardState* s) {
             g_pressure_low.store(true, std::memory_order_relaxed);
             sc.base_ws = ws;   // the fallback ceiling is measured against the entry working set
             const bool prio = cfg.priority && set_memory_priority(kMemoryPriorityVeryLow);
-            if (dec.emergency && cfg.trim != MemGuardTrim::Off) {
-                hard_trim("LOW (emergency)");
-            } else if (cfg.trim == MemGuardTrim::Off) {
+            // A cliff goes hard only when asked (`emergency_trim == Hard`); the default sends a larger
+            // proportional soft ceiling instead.  EmptyWorkingSet is expensive and throws the whole working
+            // set away - it re-faults everything - while the ceiling plus VERY_LOW priority already makes
+            // the OS reclaim this process's cheap pages first.
+            const bool cliff_hard = dec.emergency && cfg.emergency_trim == MemGuardTrim::Hard;
+            if (cfg.trim == MemGuardTrim::Off) {
                 std::fprintf(stderr,
                              "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB); memory priority %s, "
                              "trim off%s\n",
                              (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
                              prio ? "VERY_LOW" : "unchanged", notify_low ? ", OS signalled low" : "");
-            } else if (cfg.trim == MemGuardTrim::Hard) {
-                hard_trim("LOW (hard)");
+            } else if (cfg.trim == MemGuardTrim::Hard || cliff_hard) {
+                hard_trim(dec.emergency ? "LOW (emergency)" : "LOW (hard)");
             } else {
                 const uint64_t before = working_set_bytes();
                 const uint64_t ceiling = soft_trim(dec.release_mib << 20);
                 std::fprintf(stderr,
                              "strata memory-guard: LOW (RAM %llu MiB, commit %llu MiB, ws %llu MiB); "
-                             "soft ceiling -> %llu MiB, memory priority %s%s\n",
+                             "soft ceiling -> %llu MiB, memory priority %s%s%s\n",
                              (unsigned long long) (avail >> 20), (unsigned long long) (commit >> 20),
                              (unsigned long long) (before >> 20), (unsigned long long) (ceiling >> 20),
                              prio ? "VERY_LOW" : "unchanged",
+                             dec.emergency ? ", cliff" : "",
                              notify_low ? ", OS signalled low" : "");
             }
             std::fflush(stderr);
@@ -486,12 +500,21 @@ void guard_loop(GuardState* s) {
                          prio ? ", memory priority NORMAL" : "");
             std::fflush(stderr);
         } else if (dec.action == GuardAction::Stay) {
-            if (dec.emergency && cfg.trim != MemGuardTrim::Off) {
+            // A cliff goes hard only when `emergency_trim == Hard` (and `trim` is not Off); the default
+            // soft ceiling then re-trims on the same `retrim_ms` schedule as ordinary pressure.
+            const bool cliff_hard = dec.emergency && cfg.emergency_trim == MemGuardTrim::Hard;
+            if (cfg.trim != MemGuardTrim::Off && cliff_hard) {
                 if (!retrim || t - last_trim >= cfg.retrim_ms) hard_trim("still low (emergency)");
             } else if (cfg.trim == MemGuardTrim::Hard) {
                 if (retrim && t - last_trim >= cfg.retrim_ms) hard_trim("still low");
             } else if (cfg.trim == MemGuardTrim::Soft && dec.release_mib > 0) {
-                soft_trim(dec.release_mib << 20);
+                // Respect `retrim_ms` here too: re-applying the same ceiling every poll was pure overhead
+                // - it is the measured driver of the monitor thread's own CPU - and `retrim_ms` of 0 means
+                // "act on entry only", the same as the hard paths.
+                if (retrim && t - last_trim >= cfg.retrim_ms) {
+                    soft_trim(dec.release_mib << 20);
+                    last_trim = t;
+                }
             }
         } else if (cfg.verbose) {
             std::fprintf(stderr,
@@ -520,6 +543,7 @@ void guard_loop(GuardState* s) {
     }
 
     clear_soft_ceiling(sc);
+    g_pressure_low.store(false, std::memory_order_relaxed);   // never leave sources suppressing prefetch
     if (cfg.priority) (void) set_memory_priority(kMemoryPriorityNormal);
     if (low_evt != nullptr) CloseHandle(low_evt);
     if (high_evt != nullptr) CloseHandle(high_evt);
@@ -539,27 +563,51 @@ void guard_loop(GuardState* s) {
 // The kernel already reclaims this process's clean, file-backed expert pages without a page-file
 // write, so there is no explicit trim - only the prefetch pause and, on recovery, resuming it.
 
-/// One /proc/meminfo field in KiB (0 when absent).  MemAvailable is the kernel's own estimate of what
-/// can be allocated without swapping and it counts reclaimable page cache - the right free-RAM signal.
-uint64_t meminfo_kib(const char* key) {
+/// The /proc/meminfo fields the guard and `memory_sample` need, from ONE read of the file (it used to be
+/// opened once per field, so three times a poll).  Values are KiB; 0 when the field is absent.
+/// MemAvailable is the kernel's own estimate of what can be allocated without swapping and it counts
+/// reclaimable page cache - the right free-RAM signal; a kernel older than 3.14 has none (`have_avail`).
+struct Meminfo {
+    uint64_t avail_kib = 0;         // MemAvailable
+    uint64_t commit_limit_kib = 0;  // CommitLimit
+    uint64_t committed_kib = 0;     // Committed_AS
+    bool have_avail = false;
+};
+
+Meminfo read_meminfo() {
+    Meminfo m;
     std::ifstream f("/proc/meminfo");
-    if (!f) return 0;
-    const size_t n = std::strlen(key);
+    if (!f) return m;
     std::string line;
-    while (std::getline(f, line))
-        if (line.compare(0, n, key) == 0) return std::strtoull(line.c_str() + n, nullptr, 10);
-    return 0;
+    while (std::getline(f, line)) {
+        if (line.compare(0, 13, "MemAvailable:") == 0) {
+            m.avail_kib = std::strtoull(line.c_str() + 13, nullptr, 10);
+            m.have_avail = true;
+        } else if (line.compare(0, 12, "CommitLimit:") == 0) {
+            m.commit_limit_kib = std::strtoull(line.c_str() + 12, nullptr, 10);
+        } else if (line.compare(0, 13, "Committed_AS:") == 0) {
+            m.committed_kib = std::strtoull(line.c_str() + 13, nullptr, 10);
+        }
+    }
+    return m;
 }
 
-/// One /proc/self/status field in KiB (VmRSS, VmSwap); logging only.
-uint64_t self_status_kib(const char* key) {
+/// The /proc/self/status fields used here (VmRSS, VmSwap), one read; KiB, 0 when absent.
+struct SelfStatus {
+    uint64_t vm_rss_kib = 0;   // resident set
+    uint64_t vm_swap_kib = 0;  // this process's swapped-out bytes
+};
+
+SelfStatus read_self_status() {
+    SelfStatus s;
     std::ifstream f("/proc/self/status");
-    if (!f) return 0;
-    const size_t n = std::strlen(key);
+    if (!f) return s;
     std::string line;
-    while (std::getline(f, line))
-        if (line.compare(0, n, key) == 0) return std::strtoull(line.c_str() + n, nullptr, 10);
-    return 0;
+    while (std::getline(f, line)) {
+        if (line.compare(0, 6, "VmRSS:") == 0) s.vm_rss_kib = std::strtoull(line.c_str() + 6, nullptr, 10);
+        else if (line.compare(0, 7, "VmSwap:") == 0) s.vm_swap_kib = std::strtoull(line.c_str() + 7, nullptr, 10);
+    }
+    return s;
 }
 
 void guard_loop(GuardState* s) {
@@ -595,11 +643,14 @@ void guard_loop(GuardState* s) {
     };
 
     while (!s->stop.load(std::memory_order_relaxed)) {
-        const uint64_t avail = meminfo_kib("MemAvailable:") << 10;
-        const uint64_t commit_limit = meminfo_kib("CommitLimit:") << 10;
-        const uint64_t committed = meminfo_kib("Committed_AS:") << 10;
+        const Meminfo mi = read_meminfo();
+        const SelfStatus ss = read_self_status();
+        const uint64_t avail = mi.avail_kib << 10;
+        const uint64_t commit_limit = mi.commit_limit_kib << 10;
+        const uint64_t committed = mi.committed_kib << 10;
+        const bool have_commit = commit_limit != 0;   // CommitLimit can legitimately be 0 = exhausted
         const uint64_t commit = commit_limit > committed ? commit_limit - committed : 0;
-        const uint64_t ws = self_status_kib("VmRSS:") << 10;
+        const uint64_t ws = ss.vm_rss_kib << 10;
         const long long t = now_ms();
         samples++;
 
@@ -621,7 +672,8 @@ void guard_loop(GuardState* s) {
         const bool in_cooldown = t < cooldown_until;
         const GuardDecision dec = memory_guard_decide(cfg, low,
                                                       avail != 0 ? (avail >> 20) : 0,
-                                                      commit != 0 ? (commit >> 20) : 0,
+                                                      commit >> 20,
+                                                      have_commit,
                                                       /*os_low=*/false, in_cooldown, slope);
 
         if (dec.action == GuardAction::Enter) {
@@ -699,21 +751,26 @@ bool memory_sample(MemorySample& out) {
     return out.total_phys != 0;
 #else
     out.total_phys = total_physical_memory();
-    out.avail_phys = meminfo_kib("MemAvailable:") << 10;
-    const uint64_t cl = meminfo_kib("CommitLimit:") << 10;
-    const uint64_t ca = meminfo_kib("Committed_AS:") << 10;
+    const Meminfo mi = read_meminfo();
+    const SelfStatus ss = read_self_status();
+    out.avail_phys = mi.avail_kib << 10;
+    const uint64_t cl = mi.commit_limit_kib << 10;
+    const uint64_t ca = mi.committed_kib << 10;
     out.avail_pagefile = cl > ca ? cl - ca : 0;          // available commit (RAM + swap)
-    out.working_set = self_status_kib("VmRSS:") << 10;
-    out.pagefile_usage = self_status_kib("VmSwap:") << 10;
+    out.working_set = ss.vm_rss_kib << 10;
+    out.pagefile_usage = ss.vm_swap_kib << 10;
     return out.total_phys != 0 || out.avail_phys != 0;
 #endif
 }
 
 GuardDecision memory_guard_decide(const MemoryGuardConfig& cfg, bool low, uint64_t avail_mib,
-                                  uint64_t commit_mib, bool os_low, bool in_cooldown, double slope_mib_s) {
+                                  uint64_t commit_mib, bool have_commit, bool os_low, bool in_cooldown,
+                                  double slope_mib_s) {
     GuardDecision d;
     const bool have_avail = avail_mib != 0;
-    const bool commit_low = commit_mib != 0 && commit_mib < cfg.min_commit_mib;
+    // `have_commit` separates "the sample is unavailable" from "commit is exhausted": the old
+    // `commit_mib != 0` test excluded the worst case (a genuinely zero commit) from pressure.
+    const bool commit_low = have_commit && commit_mib < cfg.min_commit_mib;
     // A fast decline starts the release a little early; the band is a lead, not a floor, so it stays
     // close to the target (the old 2 GiB band triggered at ~2.5 GiB free and then recovered at 1 GiB -
     // an inverted pair that pulsed the guard on every transient dip).
@@ -721,7 +778,11 @@ GuardDecision memory_guard_decide(const MemoryGuardConfig& cfg, bool low, uint64
                             avail_mib <= cfg.keep_free_mib + cfg.predict_band_mib;
     const bool pressure = have_avail && (avail_mib < cfg.min_avail_mib || avail_mib < cfg.keep_free_mib) ||
                           commit_low || os_low || predictive;
-    const bool emergency = have_avail && os_low && avail_mib < cfg.emergency_mib;
+    // A genuine cliff is free RAM under the emergency floor, whether or not the OS notification fired:
+    // the notification can be disabled (`notify=0`) or unavailable (CreateMemoryResourceNotification
+    // failed), and there is none off-Windows.  The OS's own low signal only widens the floor to twice it.
+    const bool emergency = have_avail && (avail_mib < cfg.emergency_mib ||
+                                          (os_low && avail_mib < 2 * cfg.emergency_mib));
 
     // Release up to the exit floor (`keep_free + recover`) so acting lifts free RAM clear of the entry
     // band and the state does not flap; never less than `release_min_mib` once acting, because a
@@ -738,7 +799,7 @@ GuardDecision memory_guard_decide(const MemoryGuardConfig& cfg, bool low, uint64
         // recovering then re-entering every poll flapped the priority.  Hold the yield until the OS clears.
         const bool recovered = have_avail && !os_low && avail_mib > exit_floor &&
                                avail_mib > cfg.min_avail_mib + cfg.recover_mib &&
-                               (commit_mib == 0 || commit_mib > cfg.min_commit_mib + cfg.recover_mib);
+                               (!have_commit || commit_mib > cfg.min_commit_mib + cfg.recover_mib);
         if (recovered && !emergency) { d.action = GuardAction::Recover; return d; }
         d.action = GuardAction::Stay;
         d.release_mib = have_avail ? deficit_mib() : 0;
@@ -759,8 +820,30 @@ bool memory_guard_start(const MemoryGuardConfig& cfg, std::string& why) {
     std::lock_guard<std::mutex> lk(g_guard_mu);
     if (g_guard) return true;
     if (cfg.poll_ms < 50) { why = "the guard poll interval is under 50 ms"; return false; }
+    // The knobs come from the environment (`std::strtoull`, so "-1" becomes UINT64_MAX) and used to be
+    // taken unclamped.  An absurd `keep_free + recover` overflows the exit floor, which either makes
+    // recovery unreachable or asks the OS for nonsense; and `recover < predict_band` makes enter/exit an
+    // inverted pair that pulses.  Validate here, where the failure can be reported, and sanitize the rest.
+    MemoryGuardConfig c = cfg;
+    if (c.retrim_ms < 0) c.retrim_ms = 0;
+    if (c.cooldown_ms < 0) c.cooldown_ms = 0;
+    const uint64_t kMibCap = 1ull << 20;   // 1 TiB: far above any real target, and keeps every sum safe
+    if (c.keep_free_mib == 0 || c.keep_free_mib > kMibCap ||
+        c.recover_mib > kMibCap - c.keep_free_mib) {
+        why = "STRATA_MEM_GUARD_KEEP_FREE_MIB must be in [1, 1048576], and keep_free + recover under 1048576";
+        return false;
+    }
+    if (c.min_avail_mib > kMibCap || c.min_commit_mib > kMibCap || c.emergency_mib > kMibCap ||
+        c.release_min_mib > kMibCap || c.predict_band_mib > kMibCap) {
+        why = "a memory-guard MiB target is out of range (maximum 1048576)";
+        return false;
+    }
+    if (c.predictive && c.predict_band_mib > c.recover_mib) {
+        why = "STRATA_MEM_GUARD_RECOVER_MIB must be at least STRATA_MEM_GUARD_PREDICT_BAND_MIB when predictive";
+        return false;
+    }
     auto s = std::make_unique<GuardState>();
-    s->cfg = cfg;
+    s->cfg = c;
     g_pressure_low.store(false, std::memory_order_relaxed);
     g_stat_samples.store(0, std::memory_order_relaxed);
     g_stat_hard.store(0, std::memory_order_relaxed);

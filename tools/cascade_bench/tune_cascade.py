@@ -492,11 +492,13 @@ def main():
     ap.add_argument("--guard-flag", default="--memory-guard",
                     help="the engine flag the guard A/B toggles (default --memory-guard; the alias "
                          "--windows-memory-guard always works and is dropped first)")
-    ap.add_argument("--prefill-ceilings", default="auto,auto:16384",
+    ap.add_argument("--prefill-ceilings", default="auto,16384,auto:16384",
                     help="comma list of --prefill values to A/B on the winning layout (a bigger chunk reads each "
                          "cold expert once per chunk, so a long prompt reads fewer bytes; measured 605 -> 900 t/s "
-                         "on a 32 GB two-card cascade). The chunk's host staging buffers scale with it, so on a "
-                         "big-RAM PC add auto:32768; empty string skips the step")
+                         "on a 32 GB two-card cascade). Both the forced 16384 and the ceiling form auto:16384 are "
+                         "tried: auto:16384 only raises the ceiling and the engine picks the largest chunk whose "
+                         "buffers fit (15616 here), while the forced 16384 measured faster. The chunk's host "
+                         "staging buffers scale with it, so on a big-RAM PC add auto:32768; empty string skips the step")
     args = ap.parse_args()
 
     if in_wsl():
@@ -694,13 +696,18 @@ def main():
         if g_off and g_on:
             d_dec = g_on["decode_t_s"] - g_off["decode_t_s"]
             d_pre = g_on["prefill_t_s"] - g_off["prefill_t_s"]
-            guard_helps = d_dec >= 0.0
+            # Keep the guard unless it clearly costs decode.  One run per arm has a few percent of noise (two
+            # identical runs differed by ~1 t/s decode, ~10% prefill here), so a 1 t/s / 2% band stops a noisy
+            # single run from dropping a guard that is really free.  See docs/TUNING.md section 1b.
+            band = max(1.0, 0.02 * g_off["decode_t_s"])
+            guard_helps = d_dec >= -band
             log("  guard off: decode %s t/s  prefill %s t/s  hit %s%%"
                 % (g_off["decode_t_s"], g_off["prefill_t_s"], g_off["hit_pct"]))
             log("  guard on : decode %s t/s  prefill %s t/s  hit %s%%"
                 % (g_on["decode_t_s"], g_on["prefill_t_s"], g_on["hit_pct"]))
             log("  delta    : decode %+.1f t/s  prefill %+.1f t/s -> keep %s in the winning config"
                 % (d_dec, d_pre, "the guard" if guard_helps else "no guard"))
+            log("             (a within %.1f t/s decode is run-to-run noise)" % band)
             log("  NOTE: on Linux the guard only pauses cold prefetch, so a near-zero delta is expected;")
             log("        keep it for the responsive-system headroom.")
         else:

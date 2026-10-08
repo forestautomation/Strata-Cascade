@@ -233,7 +233,11 @@
     "131072",
     "--kv",
     "int8",
-    "--resident-experts",
+    "--tiered-experts",
+    "--host-budget-gib",
+    "6",
+    "--expert-cache-device1",
+    "9615",
     "--remote-expert-opt"
    ],
    "cwd": "<T>",
@@ -243,7 +247,7 @@
     1
    ],
    "gpus_asked": true,
-   "layer_split": "auto",
+   "layer_split": null,
    "lib_dirs": [
     "<cuda>"
    ],
@@ -279,7 +283,11 @@
     "131072",
     "--kv",
     "int8",
-    "--resident-experts",
+    "--tiered-experts",
+    "--host-budget-gib",
+    "6",
+    "--expert-cache-device1",
+    "11274",
     "--remote-expert-opt"
    ],
    "cwd": "<T>",
@@ -289,7 +297,7 @@
     1
    ],
    "gpus_asked": true,
-   "layer_split": "auto",
+   "layer_split": null,
    "lib_dirs": [
     "<cuda>"
    ],
@@ -325,7 +333,11 @@
     "131072",
     "--kv",
     "int8",
-    "--resident-experts",
+    "--tiered-experts",
+    "--host-budget-gib",
+    "6",
+    "--expert-cache-device1",
+    "14225",
     "--remote-expert-opt"
    ],
    "cwd": "<T>",
@@ -335,7 +347,7 @@
     1
    ],
    "gpus_asked": true,
-   "layer_split": "auto",
+   "layer_split": null,
    "lib_dirs": [
     "<cuda>"
    ],
@@ -371,7 +383,11 @@
     "131072",
     "--kv",
     "int8",
-    "--resident-experts",
+    "--tiered-experts",
+    "--host-budget-gib",
+    "6",
+    "--expert-cache-device1",
+    "14225",
     "--remote-expert-opt"
    ],
    "cwd": "<T>",
@@ -381,7 +397,7 @@
     1
    ],
    "gpus_asked": true,
-   "layer_split": "auto",
+   "layer_split": null,
    "lib_dirs": [
     "<cuda>"
    ],
@@ -457,7 +473,11 @@
     "65536",
     "--kv",
     "int8",
-    "--resident-experts",
+    "--tiered-experts",
+    "--host-budget-gib",
+    "6",
+    "--expert-cache-device1",
+    "6370",
     "--remote-expert-opt"
    ],
    "cwd": "<T>",
@@ -467,7 +487,7 @@
     1
    ],
    "gpus_asked": true,
-   "layer_split": "auto",
+   "layer_split": null,
    "lib_dirs": [
     "<cuda>"
    ],
@@ -503,7 +523,11 @@
     "65536",
     "--kv",
     "int8",
-    "--resident-experts",
+    "--tiered-experts",
+    "--host-budget-gib",
+    "6",
+    "--expert-cache-device1",
+    "7469",
     "--remote-expert-opt"
    ],
    "cwd": "<T>",
@@ -513,7 +537,7 @@
     1
    ],
    "gpus_asked": true,
-   "layer_split": "auto",
+   "layer_split": null,
    "lib_dirs": [
     "<cuda>"
    ],

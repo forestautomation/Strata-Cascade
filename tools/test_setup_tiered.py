@@ -259,23 +259,53 @@ class EndToEnd(unittest.TestCase):
         self.assertGreater(tuned[0][0], 0)                 # the free RAM was passed through
         self.assertTrue(tuned[0][1])                       # a helper GiB for the second card
 
-    def test_upstream_engine_keeps_the_low_ram_mode(self):
+    def _built(self, built):
+        """A build_engine mock that records the call and marks the engine as this fork's ported one (no compile)."""
         import tools.test_setup_golden as golden
-        ram, found = golden.PROFILES["32GB-2x24GB"]
-        # tiered_engine not patched: the mocked engine folder has no strata.exe, so the probe says "not ported"
-        code, out, cfg, asked = golden.install(ram, found, golden.argv_for("qwen", "IQ3_XXS"))
-        self.assertEqual(code, 0, out[-3000:])
-        self.assertNotIn("--tiered-experts", cfg["args"])
-        self.assertTrue("--resident-experts" in cfg["args"] or "--mmap-experts" in cfg["args"])
 
-    def test_explicit_tiered_on_upstream_falls_back(self):
+        def fake_build(*a, **k):
+            built.append(1)
+            return golden._fake_build(setup.ROOT / "engine")
+        return fake_build
+
+    def test_upstream_engine_on_a_cascade_pc_compiles_the_fork_engine(self):
+        """A low-RAM PC with a second GPU: the ready-made (upstream) engine has no --tiered-experts, so setup
+        compiles this fork's engine instead and the cascade turns on (the compile itself is mocked)."""
         import tools.test_setup_golden as golden
         ram, found = golden.PROFILES["32GB-2x24GB"]
+        built = []
         code, out, cfg, asked = golden.install(
-            ram, found, golden.argv_for("qwen", "IQ3_XXS") + ["--low-ram", "tiered"])
+            ram, found, golden.argv_for("qwen", "IQ3_XXS"),
+            extra=[mock.patch.object(setup, "build_engine", self._built(built))])
         self.assertEqual(code, 0, out[-3000:])
-        self.assertNotIn("--tiered-experts", cfg["args"])
+        self.assertTrue(built, "the fork engine must be compiled on a cascade PC")
+        self.assertIn("--tiered-experts", cfg["args"])
         self.assertIn("needs the Strata-Cascade engine", out)
+        self.assertNotIn("--resident-experts", cfg["args"])
+        self.assertNotIn("--mmap-experts", cfg["args"])
+
+    def test_explicit_tiered_on_upstream_compiles_the_fork_engine(self):
+        import tools.test_setup_golden as golden
+        ram, found = golden.PROFILES["32GB-2x24GB"]
+        built = []
+        code, out, cfg, asked = golden.install(
+            ram, found, golden.argv_for("qwen", "IQ3_XXS") + ["--low-ram", "tiered"],
+            extra=[mock.patch.object(setup, "build_engine", self._built(built))])
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertTrue(built)
+        self.assertIn("--tiered-experts", cfg["args"])
+
+    def test_upstream_engine_is_kept_when_the_cascade_is_not_wanted(self):
+        """Enough RAM (the model fits): no cascade, so the ready-made engine is kept and nothing is compiled."""
+        import tools.test_setup_golden as golden
+        ram, found = golden.PROFILES["128GB-1x24GB"]
+        built = []
+        code, out, cfg, asked = golden.install(
+            ram, found, golden.argv_for("qwen", "IQ3_XXS"),
+            extra=[mock.patch.object(setup, "build_engine", self._built(built))])
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertFalse(built, "nothing to compile when the cascade is not used")
+        self.assertNotIn("--tiered-experts", cfg["args"])
 
     def test_wsl_install_uses_upstream_low_ram(self):
         """WSL cannot page-lock the PINNED tier: even on the ported engine, setup must write upstream's low-RAM mode
@@ -309,10 +339,10 @@ class EndToEnd(unittest.TestCase):
         cascade fork).  Enter takes the default -> --tiered-experts; no helper cache (there is no second card)."""
         import tools.test_setup_golden as golden
         ram, found = 31.9, [golden.card(0, "NVIDIA GeForce RTX 3090", 24.0, "86")]
-        with mock.patch.object(setup, "tiered_engine", lambda eng: True):
-            code, out, cfg, asked = golden.install(
-                ram, found, golden.argv_for("qwen", "IQ3_XXS"),
-                answers={"Use the cascade on this card": ""})    # Enter -> the default (yes)
+        code, out, cfg, asked = golden.install(
+            ram, found, golden.argv_for("qwen", "IQ3_XXS"),
+            answers={"Use the cascade on this card": ""},        # Enter -> the default (yes)
+            extra=[mock.patch.object(setup, "tiered_engine", lambda eng: True)])
         self.assertEqual(code, 0, out[-3000:])
         self.assertTrue(any("Use the cascade on this card" in q for q in asked), asked)
         self.assertIn("--tiered-experts", cfg["args"])
@@ -321,13 +351,29 @@ class EndToEnd(unittest.TestCase):
         self.assertFalse(any(a.startswith("--expert-cache-device") for a in cfg["args"]))
         self.assertNotIn("--resident-experts", cfg["args"])
 
+    def test_one_card_fresh_clone_compiles_then_offers_the_cascade(self):
+        """One card whose RAM does not hold the model, with the ready-made (upstream) engine: setup compiles this
+        fork's engine first, so the one-card cascade offer can happen on a fresh clone (the compile is mocked)."""
+        import tools.test_setup_golden as golden
+        ram, found = 31.9, [golden.card(0, "NVIDIA GeForce RTX 3090", 24.0, "86")]
+        built = []
+        code, out, cfg, asked = golden.install(
+            ram, found, golden.argv_for("qwen", "IQ3_XXS"),
+            answers={"Use the cascade on this card": ""},        # Enter -> the default (yes)
+            extra=[mock.patch.object(setup, "build_engine", self._built(built))])
+        self.assertEqual(code, 0, out[-3000:])
+        self.assertTrue(built, "a one-card cascade PC must compile the fork engine on a fresh clone")
+        self.assertTrue(any("Use the cascade on this card" in q for q in asked), asked)
+        self.assertIn("--tiered-experts", cfg["args"])
+        self.assertEqual(cfg["args"][cfg["args"].index("--host-budget-gib") + 1], "auto")   # one card -> auto
+
     def test_one_card_low_ram_saying_no_keeps_the_resident_mode(self):
         import tools.test_setup_golden as golden
         ram, found = 31.9, [golden.card(0, "NVIDIA GeForce RTX 3090", 24.0, "86")]
-        with mock.patch.object(setup, "tiered_engine", lambda eng: True):
-            code, out, cfg, asked = golden.install(
-                ram, found, golden.argv_for("qwen", "IQ3_XXS"),
-                answers={"Use the cascade on this card": "n"})
+        code, out, cfg, asked = golden.install(
+            ram, found, golden.argv_for("qwen", "IQ3_XXS"),
+            answers={"Use the cascade on this card": "n"},
+            extra=[mock.patch.object(setup, "tiered_engine", lambda eng: True)])
         self.assertEqual(code, 0, out[-3000:])
         self.assertNotIn("--tiered-experts", cfg["args"])
         self.assertTrue("--resident-experts" in cfg["args"] or "--mmap-experts" in cfg["args"])

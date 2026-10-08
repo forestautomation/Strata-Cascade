@@ -60,6 +60,12 @@ def normalize(v, t: Path):
     return v
 
 
+def _fake_build(e: Path) -> Path:
+    """The mocked build_engine: mark the engine folder as this fork's ported engine and return it (no compile)."""
+    (e / ".ported").write_text("")
+    return e
+
+
 def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
     """setup.main() on a mocked PC -> (exit code, printed text, the written config or None, the questions asked).
     answers: None = --yes (a question fails the run), "" = Enter for every question, a list of answers in order, or
@@ -109,6 +115,10 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: t / "llama.cpp"),
             mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),
+            # a compiled ("local") engine is this fork's ported one.  The mocked probe answers from a marker the
+            # mocked build writes, so a cascade PC (which now compiles the fork engine) exercises the real decision.
+            mock.patch.object(setup, "tiered_engine", lambda e: bool(e) and (Path(e) / ".ported").exists()),
+            mock.patch.object(setup, "build_engine", lambda *a, **k: _fake_build(eng)),
             mock.patch.object(setup, "update_installed_engine", lambda *a, **k: None),
             mock.patch.object(setup, "download", fake_download),
             mock.patch.object(setup, "check_shards", lambda shards: None),
@@ -173,10 +183,11 @@ class Golden(unittest.TestCase):
     def test_the_baseline_covers_every_kind_of_pc(self):
         written = [k for k, v in self.golden.items() if v["code"] == 0]
         self.assertGreaterEqual(len(written), 20)
-        lowram_multi = self.golden["32GB-2x24GB qwen IQ3_XXS"]["config"]   # #364 -> #642: low-RAM, two cards -> both
-        self.assertIn("--resident-experts" if "--resident-experts" in lowram_multi["args"] else "--mmap-experts",
-                      lowram_multi["args"])
-        self.assertEqual(lowram_multi.get("gpu"), [0, 1])                   # 0.1.40 (#642): resident on both cards
+        # this fork compiles its engine on a low-RAM PC and turns the cascade on: the second card is a helper cache
+        cascade = self.golden["32GB-2x24GB qwen IQ3_XXS"]["config"]
+        self.assertIn("--tiered-experts", cascade["args"])
+        self.assertIsNone(cascade.get("layer_split"))                       # a helper, not a pipeline stage
+        self.assertEqual(cascade.get("gpu"), [0, 1])
 
     def test_yes(self):
         for key, ram, found, family, model in self.cases():

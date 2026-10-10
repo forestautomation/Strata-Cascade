@@ -1,9 +1,10 @@
 # Strata-Cascade: what it is, what it measured
 
-**Build this documents:** upstream Strata **v0.1.39** plus the cascade port - branch `cascade`, re-landed as one commit
-on `origin/main` (`6f32ec0`). The numbers are from a **fresh build of this port**, measured against
-a **fresh build of the same base with no port** (a throwaway stock worktree), one run each at 128K - the same
-base on both sides, so the comparisons isolate the fork. Everything not described here is upstream's.
+**Build this documents:** upstream Strata **v0.1.41** (`origin/main` `fb58e0db`) plus the cascade port - branch
+`cascade-042`, re-landed as one merge commit. The **headline numbers** were measured on a fresh build of the port on the
+**v0.1.39** base, against a fresh build of that same base with no port (a throwaway stock worktree), one run each at
+128K - the same base on both sides, so the comparisons isolate the fork. The port was later merged to **v0.1.41** and
+the cascade re-confirmed there (see the 0.1.41 note under Cascade vs stock). Everything not described here is upstream's.
 
 Cascade is **upstream Strata** plus multiple additions, built around a **cascading expert source**
 (`--tiered-experts`) that lets a PC whose RAM cannot hold every expert run the model anyway, by sorting the experts
@@ -25,14 +26,14 @@ works on Windows.
 ## Cascade vs stock upstream on the same PC
 
 Measured against a **stock upstream build** on the same machine, same model and settings. Both arms were rebuilt
-from the same base the day of the run: the cascade from this branch, the stock engine from `origin/main` (`6f32ec0`)
+from the same base the day of the run: the cascade from this branch, the stock engine from `origin/main` (`6f32ec0`, v0.1.39)
 with no port, in a throwaway worktree. Every arm: **Qwen3.8-Flash-Next IQ3_XXS, 32K-token prompt
 / 5K reply at 128K context, `--kv int8 --kv-resident 20480`**, vision on, `--spec 4 --spec-min-p
 0.5`, both cards. One run each.
 
 | Arm | Config | Decode | Prefill | Cache hit |
 | --- | --- | ---: | ---: | ---: |
-| **A. Upstream, dual-GPU (2 GPU, current)** | `--mmap-experts --remote-expert-opt --expert-cache-device1 6250` (6f32ec0) | 42.5 t/s | 252.9 t/s | 87.4% |
+| **A. Upstream, dual-GPU (2 GPU, current)** | `--mmap-experts --remote-expert-opt --expert-cache-device1 6250` (6f32ec0, v0.1.39) | 42.5 t/s | 252.9 t/s | 87.4% |
 | **B. Cascade, 2 cards (current)** | `--tiered-experts --host-budget-gib 6 --expert-cache-device1 6250 --adapt-every 8 --memory-guard` | **51.8 t/s** | **900.5 t/s** | 86.2% |
 | **C. Upstream, low-RAM (1 GPU)** | `--resident-experts`, warm OS file cache | 29.7 t/s | 434 t/s | 35% |
 | **D. Cascade, 1 card** | `--tiered-experts --host-budget-gib 8 --adapt-every 0` | 28.2 t/s | ~960 t/s | 38% |
@@ -41,6 +42,15 @@ with no port, in a throwaway worktree. Every arm: **Qwen3.8-Flash-Next IQ3_XXS, 
 rate on par with stock (86.2% vs 87.4%). That is the fresh, same-base comparison (A vs B). The gaps are far larger than
 run-to-run noise (+/-5%). The stock arm uses upstream's `--remote-expert-opt` (87.4% hit); the cascade arm does not use
 it (with it the cascade measured 47.7 t/s decode / 892.7 t/s prefill / 89.9% hit).
+
+**On upstream 0.1.41** (this branch's merge) the cascade needed two port-side changes. Upstream's #1352 **card
+reorder** ("faster card last") makes a faster-but-smaller-VRAM card the primary: measured here, CUDA0's expert cache
+fell from 9.60 to 5.78 GiB free, the prompt chunk was forced from 16384 down to 8192 and the cold reads doubled - it
+**would drop prefill from 907 to 456 t/s**, so a cascade config now pins `"gpu_order": "as_given"` (setup's
+`write_config`). And the port added a **batched cold read** (`TieredExpertSource::read_into_many`): a layer's
+contiguous cold blobs are merged into ~8 MiB unbuffered reads, so on the 32K/5K bench the cold reads went 41,070
+(71.6 GB) at ~3.0 GB/s to 12,998 (77.3 GB) at ~6.6 GB/s and **prefill 760.6 -> 906.9 t/s** (IQ3_XXS,
+`--host-budget-gib 6`, CUDA1 helper; the prompt is DMA-bound after the change).
 
 **Why**, from the engine logs of each arm:
 
@@ -283,7 +293,7 @@ RAM fill, then makes the **engine** the cheapest victim instead of paging *your*
 > guard only when the page file is on a slow disk and the desktop stutters, and let `tune_cascade.py
 > --guard` decide - it keeps the flag only when it costs no throughput.
 
-**Windows** does the full yield: it watches a free-RAM target (`STRATA_MEM_GUARD_KEEP_FREE_MIB`, default 1024) and the
+**Windows** does the full yield: it watches a free-RAM target (`STRATA_MEM_GUARD_KEEP_FREE_MIB`, default 1536) and the
 OS's own low/high memory notifications (an optional predictive decline trigger, `STRATA_MEM_GUARD_PREDICT=1`, is off by
 default). On pressure it lowers the engine's memory priority and releases the deficit with a proportional `soft`
 working-set ceiling (set to `entry_ws - deficit`); it **holds** `VERY_LOW` priority for the whole low period so the OS
@@ -334,10 +344,10 @@ it; moving the page file to an SSD is still the real fix.
   cells/layer kept in VRAM; the rest streams from pinned RAM) and vision on. Only this bench is quoted. The context
   and KV quant matter: they set how much VRAM is left for experts and how much pinned RAM the KV costs, which is
   exactly what the cascade and the stock low-RAM mode are competing for on a 32 GB PC.
-- **The stock arm** (headline A): a clean upstream `origin/main` (`6f32ec0`) build, no port, in a throwaway
+- **The stock arm** (headline A): a clean upstream `origin/main` (`6f32ec0`, v0.1.39) build, no port, in a throwaway
   worktree. It is upstream's best dual-GPU attempt (`--mmap-experts` + the
   CUDA1 helper - upstream refuses a RAM tier with it).
-- **The comparison is same-base:** the cascade and the stock engine are both built from `6f32ec0`, so the headline
+- **The comparison is same-base:** the cascade and the stock engine are both built from `6f32ec0` (v0.1.39), so the headline
   isolates the port and its configuration, not a version difference.
 - **Run count:** each arm is a single run. The headline gaps (51.8 vs 42.5 decode, 900 vs 253 prefill) are far larger
   than the +/-5% run-to-run spread.

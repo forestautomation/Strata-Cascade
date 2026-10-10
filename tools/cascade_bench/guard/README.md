@@ -76,7 +76,7 @@ sits near full - indicative, not precise. The guard itself, and the numbers behi
 ## Knobs
 
 `guard-test.ps1` exposes the `STRATA_MEM_GUARD_*` settings as parameters; the defaults are the shipped
-ones (`soft` trim, `keep_free` 1024 MiB, `recover` 1024 MiB, `release_min` 256 MiB, `emergency` 256 MiB).
+ones (`soft` trim, `keep_free` 1536 MiB, `recover` 512 MiB, `release_min` 512 MiB, `emergency` 512 MiB).
 `-GuardTrim hard` reproduces the pre-ladder behaviour (`EmptyWorkingSet`); `-GuardNotify 0`/`-GuardPredict 0`
 disable the OS notification / predictive triggers. The engine reads them from the run config's `env` block, which the
 script fills in.

@@ -94,17 +94,17 @@ enum class MemGuardTrim {
 };
 
 struct MemoryGuardConfig {
-    int poll_ms = 500;                ///< how often to sample
-    uint64_t min_avail_mib = 512;     ///< fallback floor: pressure while free physical memory is under this
-    uint64_t keep_free_mib = 1024;    ///< the free-RAM target the guard holds; pressure under it
-    uint64_t min_commit_mib = 2048;   ///< ... or available commit (RAM + page file) is under this
-    uint64_t emergency_mib = 256;     ///< below this (or the OS signals low and free RAM is under twice
+    int poll_ms = 250;                ///< how often to sample
+    uint64_t min_avail_mib = 1024;    ///< fallback floor: pressure while free physical memory is under this
+    uint64_t keep_free_mib = 1536;    ///< the free-RAM target the guard holds; pressure under it
+    uint64_t min_commit_mib = 3072;   ///< ... or available commit (RAM + page file) is under this
+    uint64_t emergency_mib = 512;     ///< below this (or the OS signals low and free RAM is under twice
                                       ///< this), release hard even in soft mode.  The floor is the driver;
                                       ///< the OS notification only widens it, so a cliff still releases with
                                       ///< `notify=0` and off-Windows (there is no notification there).
-    uint64_t recover_mib = 1024;      ///< release toward (and clear) this far above `keep_free_mib` (hysteresis)
-    uint64_t release_min_mib = 256;   ///< smallest release once the guard acts (keeps a release meaningful)
-    int retrim_ms = 3000;             ///< while pressure lasts, act again this often (0 = only on entry)
+    uint64_t recover_mib = 512;       ///< release toward (and clear) this far above `keep_free_mib` (hysteresis)
+    uint64_t release_min_mib = 512;   ///< smallest release once the guard acts (keeps a release meaningful)
+    int retrim_ms = 1000;             ///< while pressure lasts, act again this often (0 = only on entry)
     int cooldown_ms = 2000;           ///< after recovery, ignore soft pressure this long (emergency still acts)
     MemGuardTrim trim = MemGuardTrim::Soft;  ///< Windows-only trim mode; see MemGuardTrim (ignored on Linux)
     /// How a genuine cliff (free RAM under `emergency_mib`) releases, in `soft` trim mode.  `Hard`

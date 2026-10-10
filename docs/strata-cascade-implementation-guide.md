@@ -5,8 +5,8 @@ expert-source files often, so the port has to be re-landed regularly. This file 
 the changes are and where they go*; `STRATA-CASCADE.md` is the *results* document and `docs/TUNING.md` is the
 *how to tune it* document.
 
-**Target of the current port.** Upstream `origin/main` (`6f32ec0`, v0.1.39) -> branch `cascade` in `<repo>` - the
-port re-applied as a single commit on the new upstream.
+**Target of the current port.** Upstream `origin/main` (`fb58e0db`, v0.1.41) -> branch `cascade-042` in `<repo>` - the
+port re-applied as a single merge commit on the new upstream.
 
 This fork's own additions are the Windows implementation; the `also_vram` mask that lets the pinned RAM tier run
 *together with* the CUDA1..3 helper cache (upstream refuses the pair, and it is what makes the cascade faster); and
@@ -16,7 +16,7 @@ upstream [PR #80](https://github.com/Niko1221/Strata/pull/80) by @andrewcoul (cl
 the tier into `FileExpertSource`), with parts rewritten so it works on Windows.
 
 **Canonical artifacts kept for re-ports:**
-- This repo on branch `cascade` - the port applied as one commit on top of upstream 0.1.39. Every artifact below
+- This repo on branch `cascade-042` - the port applied as one merge commit on top of upstream 0.1.41. Every artifact below
   is recoverable from it alone.
 - Archive of the original 0.1.30 port as patches: `<port-patches>\0001..0004-*.patch` (outside the repo).
 - The big new file `src/core/tiered_source.cpp` (~1044 lines, verbatim) is NOT reproduced here. Recover it with:
@@ -94,11 +94,15 @@ Base-class additions in `expert_source.hpp`:
 
 ```cpp
 virtual void read_into(const uint8_t* src, uint8_t* dst, size_t n) const { std::memcpy(dst, src, n); }
+virtual void read_into_many(const uint8_t* const* src, uint8_t* const* dst, const size_t* n, size_t count) const;
 virtual bool streams_from_ssd() const { return false; }
 ```
 
 `read_into` lets an unpinned tiered blob be read with one unbuffered read instead of ~400 page faults;
-`streams_from_ssd()` lets the prompt path keep more reads in flight.
+`read_into_many` is its batched form (default: `read_into` one by one) and lets `TieredExpertSource` merge a batch's
+**contiguous** cold blobs into one request - a layer's experts sit back to back in `experts.bin`, and request size is
+what caps an NVMe (~2.3 GB/s at 2 MiB vs ~6.6 GB/s at 8 MiB on the reference rig); `streams_from_ssd()` lets the
+prompt path keep more reads in flight.
 
 ### 2.2 `include/strata/core/remote_experts.hpp`
 
@@ -137,6 +141,12 @@ Used by the adaptive tier so a pair this helper already computes is never pulled
 job with `from` still uses `copy_blob`; else memcpy). `init(blob_bytes, nthreads, ring)` takes the ring; `Prefill::init`
 sizes threads and ring from `src->streams_from_ssd()` (SSD: 2-8 threads, ring 48; in-place GGUF: 32, `4*threads`;
 else 4, 16).
+
+A worker's batch collects the `source`-backed jobs (`Job::from == nullptr`) and calls `source->read_into_many` once (the
+SSD profile batches like the file one: `STRATA_STAGER_BATCH`, default 8). `TieredExpertSource::read_into_many` merges
+each run of contiguous file blobs (up to 8 MiB) into one unbuffered read and copies the parts out; pinned/locked blobs,
+and a run whose aligned end passes the file, fall back to `read_into`. Measured (IQ3_XXS, 32K/5K, `--host-budget-gib 6`,
+CUDA1 helper): cold reads 41,070 (71.6 GB) at ~3.0 GB/s -> 12,998 (77.3 GB) at ~6.6 GB/s, **prefill 760.6 -> 906.9 t/s**.
 
 ### 2.5 `src/core/expert_cache.cpp`
 

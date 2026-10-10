@@ -246,6 +246,7 @@
     0,
     1
    ],
+   "gpu_order": "as_given",
    "gpus_asked": true,
    "layer_split": null,
    "lib_dirs": [
@@ -296,6 +297,7 @@
     0,
     1
    ],
+   "gpu_order": "as_given",
    "gpus_asked": true,
    "layer_split": null,
    "lib_dirs": [
@@ -346,6 +348,7 @@
     0,
     1
    ],
+   "gpu_order": "as_given",
    "gpus_asked": true,
    "layer_split": null,
    "lib_dirs": [
@@ -396,6 +399,7 @@
     0,
     1
    ],
+   "gpu_order": "as_given",
    "gpus_asked": true,
    "layer_split": null,
    "lib_dirs": [
@@ -486,6 +490,7 @@
     0,
     1
    ],
+   "gpu_order": "as_given",
    "gpus_asked": true,
    "layer_split": null,
    "lib_dirs": [
@@ -536,6 +541,7 @@
     0,
     1
    ],
+   "gpu_order": "as_given",
    "gpus_asked": true,
    "layer_split": null,
    "lib_dirs": [
@@ -572,8 +578,7 @@
     "--max-context",
     "65536",
     "--kv",
-    "int8",
-    "--remote-expert-opt"
+    "int8"
    ],
    "cwd": "<T>",
    "exe": "<T>/engine/<EXE>",
@@ -617,8 +622,7 @@
     "--max-context",
     "65536",
     "--kv",
-    "int8",
-    "--remote-expert-opt"
+    "int8"
    ],
    "cwd": "<T>",
    "exe": "<T>/engine/<EXE>",

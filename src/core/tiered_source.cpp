@@ -170,18 +170,18 @@ bool write_experts_bin(const std::string& gguf, const std::string& path, std::st
 // lengths and buffers, so the aligned span lands in a per-thread buffer and the blob is copied out - the same
 // shape as the Linux `O_DIRECT` path.  Returns false when the span would run past the file (the caller then reads
 // through the mapping, which is right for the last unaligned sector).
-bool read_direct_span(HANDLE h, uint64_t file_bytes, uint64_t off, uint8_t* dst, size_t n) {
-    if (h == nullptr || h == INVALID_HANDLE_VALUE || n == 0) return false;
-    const uint64_t a = align_down(off, kAlign);
-    const uint64_t end = align_up(off + n, kAlign);
-    if (end > file_bytes) return false;
+// Reads the aligned span [a, end) (both multiples of kAlign) from the unbuffered handle into a per-thread buffer;
+// returns the buffer base, or null.  `read_direct_span` (one blob) and `read_into_many` (a merged run) both use it -
+// the buffer lives until the next read on this thread, so copy the parts out before reading again.
+const uint8_t* read_direct_range(HANDLE h, uint64_t a, uint64_t end) {
+    if (h == nullptr || h == INVALID_HANDLE_VALUE || end <= a) return nullptr;
     thread_local std::vector<uint8_t> bounce;
     if (bounce.size() < (size_t) (end - a)) bounce.resize((size_t) (end - a));
     uint8_t* buf = bounce.data();
     // An OVERLAPPED with a NULL hEvent is NOT safe with several outstanding reads on one handle: the wait can be
     // signalled by another thread's completion.  Every read gets this thread's own manual-reset event.
     thread_local HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (ev == nullptr) return false;
+    if (ev == nullptr) return nullptr;
     for (uint64_t done = 0; done < end - a;) {
         OVERLAPPED ov{};
         const uint64_t at = a + done;
@@ -192,11 +192,25 @@ bool read_direct_span(HANDLE h, uint64_t file_bytes, uint64_t off, uint8_t* dst,
         DWORD got = 0;
         const DWORD want = (DWORD) std::min<uint64_t>((end - a) - done, 64u << 20);
         if (!ReadFile(h, buf + done, want, &got, &ov)) {
-            if (GetLastError() != ERROR_IO_PENDING || !GetOverlappedResult(h, &ov, &got, TRUE)) return false;
+            if (GetLastError() != ERROR_IO_PENDING || !GetOverlappedResult(h, &ov, &got, TRUE)) return nullptr;
         }
-        if (got == 0) return false;
+        if (got == 0) return nullptr;
         done += got;
     }
+    return buf;
+}
+
+// One unbuffered read of an aligned superset of [off, off+n).  `FILE_FLAG_NO_BUFFERING` wants aligned offsets,
+// lengths and buffers, so the aligned span lands in a per-thread buffer and the blob is copied out - the same
+// shape as the Linux `O_DIRECT` path.  Returns false when the span would run past the file (the caller then reads
+// through the mapping, which is right for the last unaligned sector).
+bool read_direct_span(HANDLE h, uint64_t file_bytes, uint64_t off, uint8_t* dst, size_t n) {
+    if (h == nullptr || h == INVALID_HANDLE_VALUE || n == 0) return false;
+    const uint64_t a = align_down(off, kAlign);
+    const uint64_t end = align_up(off + n, kAlign);
+    if (end > file_bytes) return false;
+    const uint8_t* buf = read_direct_range(h, a, end);
+    if (buf == nullptr) return false;
     std::memcpy(dst, buf + (size_t) (off - a), n);
     return true;
 }
@@ -613,6 +627,57 @@ void TieredExpertSource::read_into(const uint8_t* src, uint8_t* dst, size_t n) c
     std::memcpy(dst, src, n);
     g_fb_reads.fetch_add(1, std::memory_order_relaxed); g_fb_bytes.fetch_add((int64_t) n, std::memory_order_relaxed);
     g_fb_us.fetch_add(us_now() - t0, std::memory_order_relaxed);
+}
+
+// Batched cold read.  The prompt path batches consecutive experts of one layer and `experts.bin` stores a layer's
+// experts back to back, so a batch's file spans are contiguous: one request for the run is far faster on an NVMe
+// than one request per blob (measured ~2.3 GB/s at 2 MiB vs ~6.6 GB/s at 8 MiB on the reference rig).  A blob that
+// is pinned/locked (or past the file) falls back to a memcpy / the single-blob path, exactly as `read_into` does.
+void TieredExpertSource::read_into_many(const uint8_t* const* srcs, uint8_t* const* dsts,
+                                        const size_t* ns, size_t count) const {
+    if (count == 0) return;
+    constexpr uint64_t kMergeTarget = 8ull << 20;   // keep each merged request near the drive's sweet spot
+    auto is_file = [&](const uint8_t* s, size_t n) -> bool {
+        if (base_ == nullptr || s < base_ || (uint64_t) (s - base_) + n > file_bytes_) return false;
+        auto it = std::upper_bound(regs_.begin(), regs_.end(), s,
+                                   [](const uint8_t* p, const std::pair<uint8_t*, uint64_t>& r) { return p < r.first; });
+        return !(it != regs_.begin() && std::prev(it)->first + std::prev(it)->second >= s + n);
+    };
+    size_t i = 0;
+    while (i < count) {
+        if (!is_file(srcs[i], ns[i])) {   // pinned/otherwise-RAM bytes: memcpy, as read_into would
+            std::memcpy(dsts[i], srcs[i], ns[i]);
+            g_fb_reads.fetch_add(1, std::memory_order_relaxed);
+            g_fb_bytes.fetch_add((int64_t) ns[i], std::memory_order_relaxed);
+            ++i;
+            continue;
+        }
+        const uint64_t off0 = (uint64_t) (srcs[i] - base_);
+        const uint64_t a = align_down(off0, kAlign);
+        uint64_t end = off0 + ns[i];
+        size_t j = i + 1;
+        while (j < count) {   // extend over the following contiguous file blobs, up to the size cap
+            if (!is_file(srcs[j], ns[j])) break;
+            const uint64_t o = (uint64_t) (srcs[j] - base_);
+            const uint64_t e = o + ns[j];
+            if (std::max(end, e) - a > kMergeTarget) break;
+            if (e > end) end = e;
+            ++j;
+        }
+        const int64_t t0 = us_now();
+        const uint64_t end_al = align_up(end, kAlign);
+        const uint8_t* buf = end_al <= file_bytes_ ? read_direct_range((HANDLE) dfile_, a, end_al) : nullptr;
+        if (buf == nullptr) {
+            for (size_t k = i; k < j; ++k) read_into(srcs[k], dsts[k], ns[k]);   // last unaligned sector
+        } else {
+            for (size_t k = i; k < j; ++k)
+                std::memcpy(dsts[k], buf + ((uint64_t) (srcs[k] - base_) - a), ns[k]);
+            g_direct_reads.fetch_add(1, std::memory_order_relaxed);
+            g_direct_bytes.fetch_add((int64_t) (end - off0), std::memory_order_relaxed);
+            g_direct_us.fetch_add(us_now() - t0, std::memory_order_relaxed);
+        }
+        i = j;
+    }
 }
 
 void TieredExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {

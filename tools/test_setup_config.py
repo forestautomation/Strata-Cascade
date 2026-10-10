@@ -156,7 +156,7 @@ class CarryOver(unittest.TestCase):
         self.assertIn("--memory-guard", new["args"])
         self.assertIn("args --memory-guard", kept)
         self.assertEqual(new["env"]["STRATA_MEM_GUARD_KEEP_FREE_MIB"], "2048")   # the user's value stays
-        self.assertEqual(new["env"]["STRATA_MEM_GUARD_RECOVER_MIB"], "1024")     # the rest filled from the shipped set
+        self.assertEqual(new["env"]["STRATA_MEM_GUARD_RECOVER_MIB"], "512")      # the rest filled from the shipped set
         # no guard: setup adds nothing (the opt-in default)
         old2, new2 = {"args": ["--kv", "int8"]}, {"args": ["--kv", "int8"], "env": {}}
         self.assertEqual(setup.carry_over(old2, new2), [])

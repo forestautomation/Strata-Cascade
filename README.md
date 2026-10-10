@@ -41,7 +41,7 @@ either do not fit or the answer stalls on the disk. That is the exact case this 
 
 ## Why it runs faster
 
-**What this build is:** upstream Strata **v0.1.39** (`origin/main` `6f32ec0`) plus the cascade port - the *same* upstream
+**What this build is:** upstream Strata **v0.1.41** (`origin/main` `fb58e0db`) plus the cascade port - the *same* upstream
 base, so the numbers below isolate the fork and nothing else. Two ideas do the work, and both show up as raw numbers (same PC, same model,
 same context - full method in [`STRATA-CASCADE.md`](STRATA-CASCADE.md)):
 
@@ -65,7 +65,8 @@ every tier once**:
 ## Results
 
 **Qwen3.8-Flash-Next IQ3_XXS, 128K context** (8-bit KV), 32K prompt / 5K reply,
-vision on. Both current arms are fresh builds of the **same** upstream base (v0.1.39, `origin/main` `6f32ec0`), one
+vision on. The headline arms are fresh builds of the same upstream base, **v0.1.39** (`origin/main` `6f32ec0`) - the
+cascade was re-confirmed on **v0.1.41** - one
 run each, on the same PC (AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB over PCIe 4.0 x8/x8,
 SK hynix P41 2 TB SSD, Windows 11). The model is ISTA-DASLab's [IQ3_XXS quant](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS)
 of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) - the exact one setup downloads:
@@ -85,6 +86,11 @@ The current best two-card run adds the **memory guard** (see
 [`STRATA-CASCADE.md`](STRATA-CASCADE.md#the-memory-guard-opt-in)) to the layout above: 51.8 t/s decode / 900.5 t/s
 prefill / 86.2% hit, the fastest measured here. It is a single run; the guard's measured job is to keep the machine
 usable, not to add throughput.
+
+**On upstream 0.1.41** (this fork's current base) two cascade changes landed, both measured on this bench: a **batched
+cold read** lifted the cascade's prefill from **760.6 to 906.9 t/s**, and the cascade pins `"gpu_order": "as_given"` so
+upstream's new card reorder does not shrink CUDA0's expert cache (without it the same config drops to 456 t/s). See
+[`STRATA-CASCADE.md`](STRATA-CASCADE.md).
 
 > [!NOTE]
 > Measured on **Windows 11** (AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB over PCIe 4.0
@@ -120,6 +126,11 @@ Download or `git clone` this fork, then run:
 
 - **Windows:** double-click **`START-HERE.bat`**
 - **Linux:** `./setup.sh`
+
+In short: **1.** `git clone` this fork · **2.** run the command above (add **`--check`** first to see what it thinks of
+your PC, installing nothing) · **3.** press **Enter** through the questions (model, context, pictures - each has a
+recommended default) · **4.** wait while it downloads ~70 GB, prepares the model and starts, then open
+**`http://127.0.0.1:8080`**. Afterwards, optionally run **`--tune-cascade`** (see [Tuning](#tuning-both-systems)).
 
 It is the **same installer and walkthrough as upstream**: it checks your PC, asks a few questions (each with a
 recommended default - just press Enter), downloads the model (~70 GB, resumable), prepares it, and starts the app at

@@ -51,13 +51,15 @@ MIN_VRAM_GIB = 12.0
 # Windows-only and ignored (the guard there only pauses cold prefetch).  See STRATA-CASCADE.md
 # ("The memory guard") and docs/TUNING.md section 1b.
 GUARD_ENV = {
-    "STRATA_MEM_GUARD_KEEP_FREE_MIB": "1024",   # free-RAM target to hold
-    "STRATA_MEM_GUARD_RECOVER_MIB": "1024",     # release/clear this far above keep_free
-    "STRATA_MEM_GUARD_RELEASE_MIB": "256",      # smallest release once the guard acts
+    "STRATA_MEM_GUARD_KEEP_FREE_MIB": "1536",   # free-RAM target to hold
+    "STRATA_MEM_GUARD_RECOVER_MIB": "512",      # release/clear this far above keep_free
+    "STRATA_MEM_GUARD_RELEASE_MIB": "512",      # smallest release once the guard acts
     "STRATA_MEM_GUARD_PREDICT": "0",            # keep the opt-in early trigger off (the shipped default)
-    "STRATA_MEM_GUARD_MIN_MIB": "512",          # free-RAM floor that also counts as pressure
-    "STRATA_MEM_GUARD_EMERGENCY_MIB": "256",    # below this (or once the OS says low), release hard
-    "STRATA_MEM_GUARD_COMMIT_MIB": "2048",      # available-commit floor
+    "STRATA_MEM_GUARD_MIN_MIB": "1024",         # free-RAM floor that also counts as pressure
+    "STRATA_MEM_GUARD_EMERGENCY_MIB": "512",    # below this (or once the OS says low), release hard
+    "STRATA_MEM_GUARD_COMMIT_MIB": "3072",      # available-commit floor
+    "STRATA_MEM_GUARD_POLL_MS": "250",          # sample interval
+    "STRATA_MEM_GUARD_RETRIM_MS": "1000",       # re-trim rate while low
 }
 
 
@@ -486,8 +488,8 @@ def main():
     ap.add_argument("--tag", default="tune")
     ap.add_argument("--guard", action="store_true",
                     help="after the sweep, A/B the winning layout with the memory guard on and off, and keep "
-                         "it if it does not cost decode throughput. The shipped knobs (keep 1024 / "
-                         "recover 1024 / release 256 / band 512 MiB) are written into the run and the winning "
+                         "it if it does not cost decode throughput. The shipped knobs (keep 1536 / "
+                         "recover 512 / release 512 / band 512 MiB) are written into the run and the winning "
                          "config, on Windows and Linux")
     ap.add_argument("--guard-flag", default="--memory-guard",
                     help="the engine flag the guard A/B toggles (default --memory-guard; the alias "
@@ -526,6 +528,11 @@ def main():
     if "--expert-profile" not in eargs:
         log("ERROR: --tiered-experts needs --expert-profile. See docs/TUNING.md section 1.")
         return 2
+
+    # The cascade's CUDA0 is its primary expert cache; upstream's #1352 "faster card last" would reorder the cards
+    # and shrink it (measured: prefill 907 -> 456 t/s).  Pin the order, exactly as setup's write_config does, so the
+    # sweep and the winning config keep the intended primary card even when the base config predates the key.
+    cfg["gpu_order"] = "as_given"
 
     # Normalize the memory-guard knobs to the shipped values whenever the base config has the guard
     # on, so the sweep and the winning config use them too - the same numbers on Linux and Windows.

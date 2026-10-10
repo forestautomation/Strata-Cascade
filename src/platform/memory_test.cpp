@@ -73,8 +73,8 @@ int file_cache_keeps_cases() {
 }
 
 // The guard's state machine is pure (`memory_guard_decide`, platform/memory.cpp), so its enter/exit and
-// release sizing are checked here with no GPU, model or memory hog.  Defaults: keep 1024, recover 1024
-// (exit floor 2048), min_avail 512, min_commit 2048, emergency 256, release_min 256; prediction is opt-in
+// release sizing are checked here with no GPU, model or memory hog.  Defaults: keep 1536, recover 512
+// (exit floor 2048), min_avail 1024, min_commit 3072, emergency 512, release_min 512; prediction is opt-in
 // (band 512, slope 128 when `predictive` is set).
 int guard_decision_cases() {
     using namespace strata::platform;
@@ -86,29 +86,29 @@ int guard_decision_cases() {
     };
     const Case cases[] = {
         {"quiet at 3 GiB free",                       false, 3000, 8000, false, false,   0.0, GuardAction::None,    0,          false},
-        {"predict off: 1.5 GiB free, falling",        false, 1500, 8000, false, false, 500.0, GuardAction::None,    0,          false},
+        {"predict off: 1.6 GiB free, falling",        false, 1600, 8000, false, false, 500.0, GuardAction::None,    0,          false},
         {"below target at 900 MiB",                   false,  900, 8000, false, false,   0.0, GuardAction::Enter,   2048 - 900,  false},
         {"low at 1.5 GiB does not recover",           true, 1500, 8000, false, false, 500.0, GuardAction::Stay,  2048 - 1500, false},
         {"below target while low",                    true,   1100, 8000, false, false,   0.0, GuardAction::Stay,    2048 - 1100, false},
         {"recover above the exit floor",              true,   2500, 8000, false, false,   0.0, GuardAction::Recover, 0,          false},
-        {"stay: OS still signals low at 2.5 GiB",     true,   2500, 8000, true,  false,   0.0, GuardAction::Stay,    256,        false},
-        {"stay: commit still below its floor",        true,   2500, 1000, false, false,   0.0, GuardAction::Stay,    256,        false},
+        {"stay: OS still signals low at 2.5 GiB",     true,   2500, 8000, true,  false,   0.0, GuardAction::Stay,    512,        false},
+        {"stay: commit still below its floor",        true,   2500, 1000, false, false,   0.0, GuardAction::Stay,    512,        false},
         {"cooldown suppresses a new enter",           false,   900, 8000, false, true,    0.0, GuardAction::None,    0,          false},
         {"emergency breaks the cooldown",             false,   200, 8000, true,  true,    0.0, GuardAction::Enter,   2048 - 200, true},
         {"emergency cliff",                           false,   200, 8000, true,  false,   0.0, GuardAction::Enter,   2048 - 200, true},
         {"emergency holds while low",                 true,    200, 8000, true,  false,   0.0, GuardAction::Stay,    2048 - 200, true},
         // `have_commit` separates an unavailable sample from a genuinely exhausted commit (0 MiB),
         // which is the worst case and must count as pressure / block recovery.
-        {"commit exhausted (0) acts",                 false, 3000,    0, false, false,   0.0, GuardAction::Enter,   256,        false, true},
+        {"commit exhausted (0) acts",                 false, 3000,    0, false, false,   0.0, GuardAction::Enter,   512,        false, true},
         {"commit unknown is not pressure",            false, 3000,    0, false, false,   0.0, GuardAction::None,    0,          false, false},
-        {"commit exhausted blocks recovery",          true,  3000,    0, false, false,   0.0, GuardAction::Stay,    256,        false, true},
+        {"commit exhausted blocks recovery",          true,  3000,    0, false, false,   0.0, GuardAction::Stay,    512,        false, true},
         {"commit unknown allows recovery",            true,  3000,    0, false, false,   0.0, GuardAction::Recover, 0,          false, false},
         // The emergency floor itself is the driver, not the OS notification - so it still fires with
         // `notify=0` and on Linux (`os_low=false`); the OS signal only widens it to 2x the floor.
         {"emergency cliff without OS signal",         false,  200, 8000, false, false,   0.0, GuardAction::Enter,   2048 - 200, true},
         {"emergency holds without OS signal",         true,   200, 8000, false, false,   0.0, GuardAction::Stay,    2048 - 200, true},
-        {"OS low widens emergency to 2x floor",       false,  400, 8000, true,  false,   0.0, GuardAction::Enter,   2048 - 400, true},
-        {"OS low above 2x floor is not emergency",    false,  600, 8000, true,  false,   0.0, GuardAction::Enter,   2048 - 600, false},
+        {"OS low widens emergency to 2x floor",       false,  800, 8000, true,  false,   0.0, GuardAction::Enter,   2048 - 800, true},
+        {"OS low above 2x floor is not emergency",    false, 1100, 8000, true,  false,   0.0, GuardAction::Enter,   2048 - 1100, false},
     };
     int fail = 0;
     for (const Case& k : cases) {

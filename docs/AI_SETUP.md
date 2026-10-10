@@ -57,10 +57,10 @@ If the PC does not meet them, say which part is missing and stop.
 ## 2. Get Strata
 
 ```
-git clone https://github.com/Niko1221/Strata.git
+git clone https://github.com/forestautomation/Strata-Cascade.git
 ```
 
-Without git: download https://github.com/Niko1221/Strata/archive/refs/heads/main.zip and unzip it. Pick a drive with
+Without git: download https://github.com/forestautomation/Strata-Cascade/archive/refs/heads/main.zip and unzip it. Pick a drive with
 enough free space: the model files go to a `Strata-data` folder **next to** the Strata folder (or `--data-dir <path>`
 on another drive).
 
@@ -124,6 +124,22 @@ Notes:
   ~1 GB); it writes upstream's low-RAM mode instead (`--resident-experts`, else `--mmap-experts`). Do not pass
   `--low-ram tiered` on WSL, and do not run the cascade tuner there - native Linux or Windows is where the cascade
   works.
+
+### The cascade (this fork) - what setup does on its own
+
+This fork's one addition is the **cascade** (`--tiered-experts`): the experts are split across VRAM, a page-locked
+slice of RAM and the SSD, together with a second card as a helper cache. Usually you pass nothing:
+
+- **It turns on by itself** when the engine is this fork's (it knows `--tiered-experts`) **and** the model's experts do
+  not fit the PC's RAM (the same test that picks upstream's low-RAM mode) **and** there is a second usable GPU.
+- **On one card, setup asks** (recommended **yes**): it pins what RAM allows and streams the rest, without the helper's
+  extra speed. Force it with `--low-ram tiered`, or turn it off with `--low-ram resident` / `--low-ram off`.
+- Setup writes the cascade flags into `strata-<model>.json`, including `"gpu_order": "as_given"` so the primary CUDA0
+  card is not reordered to a faster-but-smaller helper, and prints what it chose.
+- **After install, offer to tune it:** `START-HERE.bat --tune-cascade` (Linux `./setup.sh --tune-cascade`) sweeps a few
+  layouts on the bundled 32K/5K bench and copies the winner over the config. Optional, and the bundled prompt overfits -
+  confirm the winner on the user's real work.
+- **WSL stays off** (see above): do not pass `--low-ram tiered` or `--tune-cascade` there.
 
 ## 5. While it downloads, tell the user
 
@@ -195,7 +211,7 @@ line when it is ready; the engine log is `strata-<model>.log` in the Strata fold
 | Python or build tools could not be installed | Install what the message names (links are printed), then rerun. |
 
 More: [TROUBLESHOOTING.md](TROUBLESHOOTING.md) and the [full table](DETAILS.md#troubleshooting). If it still fails,
-collect `strata-<model>.log` and the setup output, and suggest an issue at https://github.com/Niko1221/Strata/issues.
+collect `strata-<model>.log` and the setup output, and suggest an issue at https://github.com/forestautomation/Strata-Cascade/issues.
 
 ## Alternative: the MCP server
 

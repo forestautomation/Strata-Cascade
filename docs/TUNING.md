@@ -80,22 +80,22 @@ only; the prefetch pause, where the source has one, still applies). The engine's
 
 The knobs:
 
-- `STRATA_MEM_GUARD_KEEP_FREE_MIB` (1024) - the free-RAM target the guard holds; the release lifts free RAM to
+- `STRATA_MEM_GUARD_KEEP_FREE_MIB` (1536) - the free-RAM target the guard holds; the release lifts free RAM to
   `keep + recover` and then stops. Raise it to keep more RAM free for other apps.
-- `STRATA_MEM_GUARD_RECOVER_MIB` (1024) - how far above `keep_free` the release aims, and where the guard clears.
+- `STRATA_MEM_GUARD_RECOVER_MIB` (512) - how far above `keep_free` the release aims, and where the guard clears.
   With the predictive trigger on, it must be at least the predictive band, or the guard would enter and immediately
   recover.
-- `STRATA_MEM_GUARD_RELEASE_MIB` (256) - the smallest single release once the guard acts.
-- `STRATA_MEM_GUARD_MIN_MIB` (512) - the fallback free-RAM floor that also counts as pressure.
-- `STRATA_MEM_GUARD_EMERGENCY_MIB` (256) - the cliff floor; free RAM below it (or the OS low signal within
+- `STRATA_MEM_GUARD_RELEASE_MIB` (512) - the smallest single release once the guard acts.
+- `STRATA_MEM_GUARD_MIN_MIB` (1024) - the fallback free-RAM floor that also counts as pressure.
+- `STRATA_MEM_GUARD_EMERGENCY_MIB` (512) - the cliff floor; free RAM below it (or the OS low signal within
   twice it) releases hard even in `soft` mode, with or without `STRATA_MEM_GUARD_NOTIFY`. The hard release is
   what rescues a real cliff: measured on the reference rig, replacing it with a proportional soft ceiling
   (`STRATA_MEM_GUARD_EMERGENCY=soft`, experimental) kept free RAM pinned at ~135 MiB and collapsed decode to
   22.5 t/s (30.8M faults, 371 GB read back) against 50.6 t/s, 11.9M faults and 24.9 GB for the default hard
   cliff. Keep the default.
-- `STRATA_MEM_GUARD_COMMIT_MIB` (2048) - the available-commit floor.
-- `STRATA_MEM_GUARD_POLL_MS` (500) - the sample interval.
-- `STRATA_MEM_GUARD_RETRIM_MS` (3000) - the hard re-trim rate.
+- `STRATA_MEM_GUARD_COMMIT_MIB` (3072) - the available-commit floor.
+- `STRATA_MEM_GUARD_POLL_MS` (250) - the sample interval.
+- `STRATA_MEM_GUARD_RETRIM_MS` (1000) - the hard re-trim rate.
 - `STRATA_MEM_GUARD_COOLDOWN_MS` (2000) - the settle time after a recovery.
 - `STRATA_MEM_GUARD_PREDICT_SLOPE` (128 MiB/s) / `STRATA_MEM_GUARD_PREDICT_BAND_MIB` (512) - the **opt-in** early
   trigger (`STRATA_MEM_GUARD_PREDICT=1`): a free-RAM decline this fast within the band starts the release. Off by
@@ -198,7 +198,7 @@ What it does, in order:
    passes it too), re-runs the **winning layout** once with `--memory-guard` and once without, prints the decode /
    prefill delta, and keeps the flag in the winning config unless it costs more than the run-to-run noise (~1 t/s /
    2% decode) - the guard step for the responsive-system option (see section 1b); the two rows land in the CSV
-   with `memory_guard` 1 and 0. Both arms run the shipped knobs (keep 1024 / recover 1024 / release 256 /
+   with `memory_guard` 1 and 0. Both arms run the shipped knobs (keep 1536 / recover 512 / release 512 /
    band 512 MiB) through the config's `env`, and those knobs are written into the winning config when the guard is
    kept - the same on Linux and Windows (the Linux guard only pauses cold prefetch, so a near-zero delta is
    expected);
@@ -230,7 +230,8 @@ starting its helper sweep at 4 GiB.
 
 **On a small PC it warns but still runs.** If the machine has less than ~32 GB of RAM or a primary card under
 12 GB, it prints `WARNING: INSUFFICIENT MEMORY - RESULTS MAY FAIL` with the reason and continues - a smaller model
-(such as Q2_0 or IQ2_XS) may still tune fine.
+(such as Q2_0 or IQ2_XS) may still tune fine. A layout that does not come up at all (a `NOT READY` line for it, e.g. a
+helper cache sized too large) is skipped the same way and the sweep continues.
 
 **It scales the helper size to your model.** The expert *bytes per expert* differ by quant (IQ2_XS < IQ3_XXS <
 IQ3_S < Coder), so the tuner does a single probe start, reads the pack's real per-expert size from the engine log
@@ -242,7 +243,9 @@ IQ3_XXS, IQ3_S and the Coder model.
 (`--expert-cache-device1..3`), each sized from that card's own VRAM. A single-GPU machine just skips the helper
 sweep. Because those cards are helper caches and not pipeline stages, a cascade config carries `layer_split: null` -
 setup writes it that way (and repairs an older config on the next start): the engine refuses a layer split beside a
-helper when no GPU is left over.
+helper when no GPU is left over. The cascade config also pins `"gpu_order": "as_given"` (setup and the tuner both write
+it): upstream's #1352 "faster card last" reorder is for a layer split and would make a faster-but-smaller card CUDA0,
+shrinking its expert cache (measured: prefill 907 -> 456 t/s).
 
 ### 3.1 Files it writes
 

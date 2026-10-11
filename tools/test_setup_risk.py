@@ -203,6 +203,14 @@ class BrokenEarlierConfig(unittest.TestCase):
             self.assertEqual(json.loads(p.read_text(encoding="utf-8")), {"args": ["--kv", "int8"]})   # kept whole
 
 
+def install_no_cascade(ram, found, argv, **kw):
+    """install() with the cascade switched off.  The low-RAM tests below cover upstream's rules (one GPU, mapped vs
+    resident), which this fork keeps for an engine without --tiered-experts; a PC the cascade fits gets
+    --tiered-experts instead, and tools/test_setup_tiered.py covers that path."""
+    kw["extra"] = list(kw.get("extra", [])) + [mock.patch.object(setup, "tiered_engine", lambda e: False)]
+    return install(ram, found, argv, **kw)
+
+
 class LowRamGpus(unittest.TestCase):
     """S2/S3 (#364 #384): one GPU recommended in the low-RAM mode, all of them when asked for."""
 
@@ -217,8 +225,8 @@ class LowRamGpus(unittest.TestCase):
         for prof, model in (("32GB-2x24GB", "IQ3_XXS"), ("32GB-2x24GB", "Q2_0"), ("47GB-2x16GB", "IQ3_XXS")):
             with self.subTest(prof=prof, model=model):
                 ram, found = PROFILES[prof]
-                code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", model, "--no-start",
-                                                         "--gpus", "0,1"])
+                code, out, cfg, _ = install_no_cascade(ram, found, ["--family", "qwen", "--model", model, "--no-start",
+                                                                    "--gpus", "0,1"])
                 self.assertEqual(code, 0, out)
                 self.assertEqual(cfg["gpu"], [0, 1])
                 self.assertEqual(cfg["layer_split"], "auto")
@@ -237,8 +245,8 @@ class LowRamGpus(unittest.TestCase):
 
     def test_asked_and_answered_two(self):
         ram, found = PROFILES["32GB-2x24GB"]
-        code, out, cfg, asked = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
-                                        answers={"Low-RAM mode: which GPUs?": "2"})
+        code, out, cfg, asked = install_no_cascade(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
+                                                   answers={"Low-RAM mode: which GPUs?": "2"})
         self.assertEqual(code, 0, out)
         self.assertTrue(any("Low-RAM mode: which GPUs? [1]" in q for q in asked), asked)
         self.assertEqual(cfg["gpu"], [0, 1])
@@ -248,8 +256,8 @@ class LowRamGpus(unittest.TestCase):
     def test_yes_and_enter_keep_one_gpu(self):
         ram, found = PROFILES["32GB-2x24GB"]
         for answers in (None, ""):
-            code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
-                                        answers=answers)
+            code, out, cfg, _ = install_no_cascade(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
+                                                   answers=answers)
             self.assertEqual(code, 0, out)
             self.assertEqual(cfg["gpu"], 0)
             self.assertIn("--resident-experts", cfg["args"])
@@ -275,15 +283,15 @@ class LowRamGpus(unittest.TestCase):
         """#642: an engine that runs the resident variant on a layer split keeps the cards together, resident."""
         ram, found = PROFILES["32GB-2x24GB"]
         with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
-            code, out, cfg, asked = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
-                                            answers="")
+            code, out, cfg, asked = install_no_cascade(ram, found, ["--family", "qwen", "--model", "Q2_0",
+                                                                    "--no-start"], answers="")
             self.assertEqual(code, 0, out)
             self.assertEqual(cfg["gpu"], [0, 1])
             self.assertIn("--resident-experts", cfg["args"])
             self.assertFalse(any("Low-RAM mode" in q for q in asked), asked)
             self.assertIn("stay in RAM", out)
-            code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start",
-                                                     "--gpus", "0,1", "--low-ram", "resident"])
+            code, out, cfg, _ = install_no_cascade(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start",
+                                                                "--gpus", "0,1", "--low-ram", "resident"])
             self.assertEqual(code, 0, out)
             self.assertEqual(cfg["gpu"], [0, 1])
             self.assertIn("--resident-experts", cfg["args"])
@@ -488,6 +496,7 @@ class RulesAgreeWithTheWrittenConfig(unittest.TestCase):
     def go(self, ram, cards, model, *flags):
         return install(ram, cards, ["--family", "qwen", "--model", model, "--no-start", *flags])
 
+    @mock.patch.object(setup, "is_wsl", lambda: False)   # #974: not WSL, as in install()
     def test_the_streaming_rule_is_the_flag_setup_writes(self):
         for model, ctx, kv, choice in itertools.product(("Q2_0", "IQ3_XXS", "IQ3_S"), ("32768", "131072"),
                                                         ("int8", "q4_0", "k8v4"), ("auto", "on", "off")):
@@ -504,7 +513,8 @@ class RulesAgreeWithTheWrittenConfig(unittest.TestCase):
                                                               ("auto", "on", "off", "mmap")):
             code, out, cfg, _ = self.go(ram, cards, model, "--low-ram", choice)
             self.assertEqual(code, 0, out)
-            low = "--resident-experts" in cfg["args"] or "--mmap-experts" in cfg["args"]
+            low = ("--resident-experts" in cfg["args"] or "--mmap-experts" in cfg["args"]
+                   or "--tiered-experts" in cfg["args"])   # the cascade is this fork's low-RAM mode
             self.assertEqual(low, setup.low_ram_wanted(model, ram, choice),
                              f"{model} on {ram:.0f} GB of RAM, --low-ram {choice}: setup wrote {cfg['args']}")
 

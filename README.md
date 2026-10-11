@@ -41,7 +41,7 @@ either do not fit or the answer stalls on the disk. That is the exact case this 
 
 ## Why it runs faster
 
-**What this build is:** upstream Strata **v0.1.41** (`origin/main` `fb58e0db`) plus the cascade port - the *same* upstream
+**What this build is:** upstream Strata **v0.1.43** (`origin/main` `7695859a`) plus the cascade port - the *same* upstream
 base, so the numbers below isolate the fork and nothing else. Two ideas do the work, and both show up as raw numbers (same PC, same model,
 same context - full method in [`STRATA-CASCADE.md`](STRATA-CASCADE.md)):
 
@@ -87,10 +87,31 @@ The current best two-card run adds the **memory guard** (see
 prefill / 86.2% hit, the fastest measured here. It is a single run; the guard's measured job is to keep the machine
 usable, not to add throughput.
 
-**On upstream 0.1.41** (this fork's current base) two cascade changes landed, both measured on this bench: a **batched
+**IQ3_S (the best-quality size) runs on the same rig too.** The cascade's job is to run a model whose experts do
+not fit RAM, so it runs the larger quant with the same layout - a small quality gain for some decode, and *better*
+prompt reading:
+
+| Config, 2 cards + memory guard | Decode | Prefill | Cache hit |
+| --- | ---: | ---: | ---: |
+| IQ3_XXS (the headline - fastest) | **51.8 t/s** | 900.5 t/s | 86.2% |
+| IQ3_S (best quality) | **41.0 t/s** | **1023 t/s** | 78.3% |
+
+IQ3_S's experts are ~18% bigger (50.3 vs 42.9 GB), so the same VRAM and the same 6 GiB pin hold ~1,600 fewer of
+them and ~2,100 more fall to the COLD tier (23.43 GiB against 16.49 GiB) - which is the whole decode cost (79% of
+IQ3_XXS). That cost is the **CPU pool** computing the cold experts, not the SSD: a profile of a 5K reply spends
+25.7 ms of a 53 ms window in the pool while the SSD reads **0 MB/s** (the cold experts come from RAM). Numbers,
+tiers and method: [`STRATA-CASCADE.md`](STRATA-CASCADE.md#23-iq3_s-on-the-same-rig).
+
+**On upstream 0.1.41** (the previous base) two cascade changes landed, both measured on this bench: a **batched
 cold read** lifted the cascade's prefill from **760.6 to 906.9 t/s**, and the cascade pins `"gpu_order": "as_given"` so
 upstream's new card reorder does not shrink CUDA0's expert cache (without it the same config drops to 456 t/s). See
 [`STRATA-CASCADE.md`](STRATA-CASCADE.md).
+
+**On upstream 0.1.43** (this fork's current base) the cascade re-ran the same IQ3_S bench unchanged and **did not
+regress**: decode **45.3 t/s** (was 41.0) and prefill **984.9 t/s** (was 1023, inside the ±5% spread), hit 81.5% (was
+78.3%). The decode gain is upstream's new `STRATA_ROUTE_TAIL_SKIP=7` default (+10..20% on cards that miss experts; the
+answers differ slightly from 0.1.41), which the merged cascade keeps on; upstream's `PcieAuto` also refines the
+cascade's `pcie_frac` at run time (0.40 -> 0.45).
 
 > [!NOTE]
 > Measured on **Windows 11** (AMD Ryzen 7 5800X, 32 GB DDR4-3600, RTX 5060 Ti 16 GB + RTX 3060 12 GB over PCIe 4.0
@@ -363,6 +384,8 @@ download stops, run it again: it continues where it left off. Your browser opens
 **Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
 its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
 several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
+
+**Is it fast on your PC?** Run `BENCH.bat` (`./bench.sh`): about 5-10 minutes, it measures chat, 4K/16K prompts and an agent-style session with your own settings and writes a report to share ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
 
 ## Which model should I pick?
 

@@ -10,6 +10,12 @@ reserve", and (with a second GPU) 2 --expert-cache-device1 sizes. Enough to
 find a good layout in a few minutes; a full sweep would overfit the bench
 prompt (docs/TUNING.md section 4).
 
+The values it starts from are the measured ones: --host-budget-gib 6
+--host-reserve-gib 4 (the cap beside a helper), the forced --prefill 16384, and
+the memory guard on.  On the 32 GB reference rig (Ryzen 7 5800X, RTX 5060 Ti
+16 GB + RTX 3060 12 GB) that layout measured IQ3_XXS 51.8 t/s decode / 900 t/s
+prefill and IQ3_S 41 t/s / 1023 t/s (STRATA-CASCADE.md section 2.3).
+
 Usage (normally through the .ps1/.sh wrapper, which fills in --free-gib etc.):
 
   python tools/cascade_bench/tune_cascade.py --config strata-<model>.json
@@ -819,6 +825,10 @@ def main():
             log("  guard knobs: keep %s / recover %s / release %s MiB  (written to the config)"
                 % (GUARD_ENV["STRATA_MEM_GUARD_KEEP_FREE_MIB"], GUARD_ENV["STRATA_MEM_GUARD_RECOVER_MIB"],
                    GUARD_ENV["STRATA_MEM_GUARD_RELEASE_MIB"]))
+    log("  reference: the 32 GB reference rig (Ryzen 7 5800X, RTX 5060 Ti 16 GB + RTX 3060 12 GB) measured this")
+    log("             layout at IQ3_XXS 51.8 t/s decode / 900 t/s prefill and IQ3_S 41 t/s / 1023 t/s")
+    log("             (STRATA-CASCADE.md section 2.3). Keep --expert-cache-device1 auto for a bigger quant: a count")
+    log("             tuned for a smaller one leaves CUDA1 with <512 MiB free and the engine refuses to start.")
     if any(r.get("oom") for r in rows):
         log("  note: at least one layout ran out of memory in prefill - see the CSV's oom column")
     log("  CSV   : %s" % csv_path)

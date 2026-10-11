@@ -50,6 +50,12 @@ A card with more VRAM is faster, because more of the model fits on the GPU: an R
 [details](DETAILS.md#speed-measured). The AMD measurements per card (RX 9070 XT, Radeon AI PRO R9700, RX 7800 XT,
 RX 9060 XT, RX 6900 XT) are in [AMD_HIP.md](AMD_HIP.md#rdna4-gfx1201).
 
+**On a 32 GB PC via the cascade** - a model whose experts do not fit RAM (the [reference
+rig](../STRATA-CASCADE.md): Ryzen 7 5800X, 32 GB, RTX 5060 Ti 16 GB + RTX 3060 12 GB; 128K context, 32K/5K bench):
+**IQ3_XXS 51.8 t/s** decode / 900 t/s prefill, and **IQ3_S 41 t/s** decode / **1023 t/s** prefill. So IQ3_S - which
+the RAM table below sends to a 96 GB+ PC - runs on 32 GB at ~79% of IQ3_XXS's decode, for a small quality gain and
+*faster* prompt reading. See [`../STRATA-CASCADE.md`](../STRATA-CASCADE.md#23-iq3_s-on-the-same-rig).
+
 Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
 (about 15-30 minutes, longer on a slow card; on the PC above it made the Coder 7% faster; NVIDIA cards for now). Measured Strata on your own
 PC? See [Community benchmark results](COMMUNITY_BENCHMARKS.md) for a report template and how to share your results
@@ -62,7 +68,7 @@ in a pull request.
 | **Q2_0** | 37.6 GB | fastest | good |
 | **IQ2_XS** | 39.2 GB | fast | better (**recommended**) |
 | **IQ3_XXS** | 47.0 GB | slower | great |
-| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests (original model only) |
+| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests |
 
 The download is 66-76 GB for the three smaller sizes ([details](DETAILS.md#which-model)); the first start also
 fetches the MTP draft layer (~6 GB, +1 GB with images).
@@ -82,7 +88,9 @@ On a PC whose RAM cannot hold the experts beside the system, setup maps them fro
 in RAM only what the graphics card does not hold (the [low-RAM mode](DETAILS.md#speed-measured), chosen by setup). For
 example, a 32 GB PC with a 24 GB GPU runs Q2_0, IQ2_XS and the Coder this way, and a 32 GB PC with a 12-16 GB GPU the
 Coder. With a small card most experts then come from the SSD and it is much slower (setup says so).
-`START-HERE.bat --setup --low-ram on|off` overrides the choice.
+`START-HERE.bat --setup --low-ram on|off` overrides the choice. This fork goes further: on a 32 GB PC **with a
+second GPU** the [cascade](../STRATA-CASCADE.md) runs the full **IQ3_S** (50 GB of experts) at ~41 t/s decode /
+~1023 t/s prefill, sorting the experts across VRAM, a pinned RAM budget and the SSD.
 
 ## The versions
 
@@ -110,7 +118,7 @@ START-HERE.bat --setup --family coder
 
 **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** - a fine-tune by UkisAI that
 thinks much shorter before answering, so you get the answer sooner, with about the same quality. Same speed per
-token, and about the same RAM as the same size of the original (no IQ3_S). Its own license applies (see its page).
+token, and about the same RAM as the same size of the original. Its own license applies (see its page).
 More: [details](DETAILS.md#or-swift-15-a-fine-tune-that-thinks-shorter).
 
 ```

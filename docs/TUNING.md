@@ -33,6 +33,13 @@ competes with CUDA0's cache for the prefill borrow, so past ~6 GiB a 16 GB prima
 and pinning is *not* the same as letting the OS page - the pinned set is locked, so it does not thrash the pagefile
 the way upstream's page-cache low-RAM mode can.
 
+**Size the helper to the model, not to a fixed count.** `--expert-cache-device1 N` asks for N experts on the second
+card, but the bytes per expert differ by quant (IQ2_XS < IQ3_XXS < IQ3_S < Coder), so a count tuned for a smaller
+size is too large for a bigger one and the engine refuses to start
+(`CUDA1 experts: slots leave less than 512 MiB free; reduce --expert-cache-device1`). `auto` (or setup's computed
+count) always fits: moving a 6250-expert helper from IQ3_XXS to IQ3_S needs `auto` (5536 here). The layout tuner
+sizes the helper from the pack's real per-expert bytes for this reason (section 3).
+
 **KV streaming is setup's job, not the tuner's.** At 64K context or more, when the whole KV fits in RAM, setup
 enables it automatically (`--kv-resident 32768`: a 32K window of each QSA layer in VRAM, the rest in pinned RAM) so
 the freed VRAM holds more experts - upstream's own rule. Below 64K, or when it does not fit, the KV stays in VRAM.

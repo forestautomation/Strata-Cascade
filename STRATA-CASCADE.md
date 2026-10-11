@@ -1,10 +1,11 @@
 # Strata-Cascade: what it is, what it measured
 
-**Build this documents:** upstream Strata **v0.1.41** (`origin/main` `fb58e0db`) plus the cascade port - branch
-`cascade-042`, re-landed as one merge commit. The **headline numbers** were measured on a fresh build of the port on the
+**Build this documents:** upstream Strata **v0.1.43** (`origin/main` `7695859a`) plus the cascade port - branch
+`cascade-043`, re-landed as one merge commit. The **headline numbers** were measured on a fresh build of the port on the
 **v0.1.39** base, against a fresh build of that same base with no port (a throwaway stock worktree), one run each at
-128K - the same base on both sides, so the comparisons isolate the fork. The port was later merged to **v0.1.41** and
-the cascade re-confirmed there (see the 0.1.41 note under Cascade vs stock). Everything not described here is upstream's.
+128K - the same base on both sides, so the comparisons isolate the fork. The port was later merged to **v0.1.41**, then
+**v0.1.43**, and the cascade re-confirmed on each (see the 0.1.41 and 0.1.43 notes under Cascade vs stock). Everything
+not described here is upstream's.
 
 Cascade is **upstream Strata** plus multiple additions, built around a **cascading expert source**
 (`--tiered-experts`) that lets a PC whose RAM cannot hold every expert run the model anyway, by sorting the experts
@@ -51,6 +52,12 @@ fell from 9.60 to 5.78 GiB free, the prompt chunk was forced from 16384 down to 
 contiguous cold blobs are merged into ~8 MiB unbuffered reads, so on the 32K/5K bench the cold reads went 41,070
 (71.6 GB) at ~3.0 GB/s to 12,998 (77.3 GB) at ~6.6 GB/s and **prefill 760.6 -> 906.9 t/s** (IQ3_XXS,
 `--host-budget-gib 6`, CUDA1 helper; the prompt is DMA-bound after the change).
+
+**On upstream 0.1.43** (the current base) the port re-landed with no cascade change needed: the same IQ3_S config
+re-ran and **did not regress** - decode **45.3 t/s** (was 41.0) and prefill **984.9 t/s** (was 1023, inside the
++/-5% spread), hit 81.5% (was 78.3%). The decode gain is upstream's new `STRATA_ROUTE_TAIL_SKIP=7` default, on for a
+CUDA serve that misses experts (+10..20%; the answers differ slightly from 0.1.41), and upstream's `PcieAuto` now
+refines the cascade's `pcie_frac` at run time (0.40 -> 0.45 on this rig). One run each.
 
 **Why**, from the engine logs of each arm:
 
@@ -173,6 +180,33 @@ computing COLD experts, which no GPU policy can reach. The CUDA1 helper's own wa
 profile. The lesson: the cascade already protects the helper; the remaining wall is COLD CPU work, which needs more
 VRAM, a faster CPU, or a workload-specific profile to move (bench prompts overfit - see section 5).
 
+### 2.3 IQ3_S on the same rig
+
+The cascade runs the larger, best-quality size too, with the same layout - it is the whole point of a fork whose
+model does not fit RAM. Same rig, same 32K/5K bench at 128K context, engine 0.1.41, one run each
+(`--tiered-experts --host-budget-gib 6 --host-reserve-gib 4 --expert-cache-device1 auto --prefill 16384
+--adapt-every 8 --adapt-swaps 32 --memory-guard`):
+
+| Quant | Decode | Prefill | Cache hit | COLD tier |
+| --- | ---: | ---: | ---: | ---: |
+| **IQ3_XXS** (the headline) | **51.8 t/s** | 900.5 t/s | 86.2% | 16.49 GiB |
+| **IQ3_S** | **41.0 t/s** | **1023 t/s** | 78.3% | 23.43 GiB |
+
+IQ3_S tiers: `VRAM 9178 experts (17.41 GiB, 5536 held by CUDA1) | PINNED 3152 (5.99 GiB) | COLD 12246 (23.43 GiB,
+paged from SSD) | budget 6.00 GiB`; `CUDA1: 5536 additional experts, 10.45 GiB`. Its experts are ~18% bigger (50.3
+vs 42.9 GiB), so the same VRAM and the same 6 GiB pin hold ~1,600 fewer of them and ~2,100 more fall to COLD. That
+is the whole decode cost - 79% of IQ3_XXS - and it is why prefill moves the *other* way (+14%): the bigger quant
+reads fewer experts per token, and the forced 16384 chunk reads each cold expert once per chunk. A re-run of the
+same config measured 41.5 t/s / 978 t/s, inside the +/-5% run-to-run spread.
+
+**Where the time goes (profiled).** `STRATA_DECODE_TIMING=1` on the 5K reply: **53.2 ms/window** =
+verify 48.9 (GPU-reach wait 14.8 + per-layer host 32.4 [plan 6.1, **CPU 25.7**] + stage 0.2) + draft 3.6. The GPU
+spends a matching **25.8 ms/window idle** (`waitCPU` 19.5 on the GDN layers + 6.3 on the QSA layers) waiting for
+the CPU pool. So IQ3_S decode here is **CPU-pool-bound, not SSD-bound**. Confirmed by the disk: the P41 read
+**0 MB/s** during the decode (its counter reads 3.3 GB/s on a real read), i.e. the 417 GB of logged COLD reads came
+from the OS page cache, not the SSD. That is the reason a 32 GB PC can match a much larger one on this quant, and
+why a 4-way live reshuffle would move *which* experts are cold, not how much CPU the cold set costs.
+
 ---
 
 ## 3. Phase C - the adaptive tier, corrected
@@ -246,6 +280,13 @@ The two lessons: with a second card, **more pinned is not always better** - past
 opposite: pin the maximum and leave the adaptive tier **off** - it is a helper-protecting mechanism with nothing to
 protect when there is no helper. The engine's own safety ceiling follows the same split (**6 GiB beside a helper,
 24 GiB on one card**; `STRATA_TIERED_PIN_CAP_GIB` overrides).
+
+**The same layout on IQ3_S** (the bigger experts, so the helper is sized to them: `--expert-cache-device1 auto`
+gives 5536, not IQ3_XXS's 6250): the 6 GiB row measures **41.0 t/s decode / 1023 t/s prefill / 78.3% hit** - the
+decode cost of the larger quant (section 2.3). Only the helper count changes with the quant: a count tuned for a
+smaller size (6250) leaves less than 512 MiB free on the 3060 and the engine refuses to start
+(`CUDA1 experts: slots leave less than 512 MiB free; reduce --expert-cache-device1`); `auto` (or setup's computed
+count) always fits.
 
 Re-confirmed on the current engine. With everything else at the 6 GiB optimum, only `--host-budget-gib` was raised
 to 8: the engine logged `only 0 MiB free once the slots are written ... shrinking the expert cache`, registered the

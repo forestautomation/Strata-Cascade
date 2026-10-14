@@ -5,8 +5,8 @@ expert-source files often, so the port has to be re-landed regularly. This file 
 the changes are and where they go*; `STRATA-CASCADE.md` is the *results* document and `docs/TUNING.md` is the
 *how to tune it* document.
 
-**Target of the current port.** Upstream `origin/main` (`fb58e0db`, v0.1.41) -> branch `cascade-042` in `<repo>` - the
-port re-applied as a single merge commit on the new upstream.
+**Target of the current port.** Upstream `origin/main` (`296b59d2`, v0.1.44.1) -> branch `cascade-044` in `<repo>` - the
+port re-landed as one merge commit on the new upstream (0.1.41 -> 0.1.43 -> 0.1.44.1; the same shape each time).
 
 This fork's own additions are the Windows implementation; the `also_vram` mask that lets the pinned RAM tier run
 *together with* the CUDA1..3 helper cache (upstream refuses the pair, and it is what makes the cascade faster); and
@@ -29,18 +29,18 @@ the tier into `FileExpertSource`), with parts rewritten so it works on Windows.
 
 ## 0. Why this port exists (the one fact that decides everything)
 
-Upstream aborts when a RAM tier meets a remote expert cache (`src/program/generate.cpp`, line 1367):
+Upstream aborts when a RAM tier meets a remote expert cache (`src/program/generate.cpp`):
 
 ```cpp
-if (o.resident_cpu_experts && (!o.layer_split.empty() || remote_caches)) {
-    std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
+if (o.resident_cpu_experts && remote_caches) {
+    std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support remote expert caches\n");
     return 2;
 }
 ```
 
-So a PC whose RAM cannot hold every expert has no legal way to combine a RAM tier with the CUDA1..3 helper. Cascade
-is that combination: **VRAM + CUDA1..3 helper + pinned RAM budget + cold SSD reads, at once.** If upstream ever
-allows the two together, this port can be dropped.
+Since 0.1.44 a layer split may *also* keep the resident RAM mode, but a CUDA1..3 helper still cannot: with a RAM tier
+and a helper, upstream's only legal choices are the two apart. Cascade is that combination: **VRAM + CUDA1..3 helper +
+pinned RAM budget + cold SSD reads, at once.** If upstream ever lets the two together, this port can be dropped.
 
 ---
 
@@ -252,6 +252,10 @@ upstream** when the ported engine is absent, so a rebase only ever has to merge 
 - **Detection:** `tiered_engine(eng)` probes `<engine>/strata.exe --help` for `--tiered-experts` (cached per path,
   time-bounded, `False` on any error). The version number cannot identify the port - the fork re-lands on the same
   upstream version - so the binary is the only honest signal. No engine or CMake change is needed.
+- **The engine:** upstream 0.1.44 folded the engine choice into `engine_step(...)`; the fork threads a `cascade=`
+  argument through it, so a ready-made (upstream) engine is rejected and this fork's is compiled when the cascade is
+  wanted. A "ready" pack (NVFP4) is excluded from the auto rules (`cascade_ok = not fam.get("ready")`): its low-RAM
+  mode is upstream's RAM-budget one, so only an explicit `--low-ram tiered` selects the cascade there.
 - **The default:** `tiered_should_default(model, ram, found)` = the model does not fit RAM (the low-RAM test) AND
   `together_ok(found)` offers a second shareable card. It looks at the cards **detected**, not chosen: the low-RAM
   recommendation deliberately picks one GPU, and the cascade's win is turning the second into a helper. On **one**

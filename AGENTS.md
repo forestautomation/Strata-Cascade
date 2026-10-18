@@ -9,11 +9,13 @@ one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
 Everything here is **upstream Strata** plus multiple additions, built around the **cascading expert source** (`--tiered-experts`),
 which sorts the experts across VRAM, a pinned RAM budget and the SSD so a PC whose RAM cannot hold every expert
-still runs the model, and combines that with the CUDA1..3 helper (a combination upstream rejects). The port lives
-on branch `cascade` (`forestautomation/Strata-Cascade`).
+still runs the model, and combines that with the CUDA1..3 helper. The port lives on branch `cascade`
+(`forestautomation/Strata-Cascade`).
 
-- **Do not "fix" the cascade away.** Upstream's own `--resident-cpu-experts` is not a replacement: it hard-rejects
-  the helper. The port is the point of this fork.
+- **Do not "fix" the cascade away.** Upstream used to hard-reject the helper beside a RAM tier; 0.1.45 lifts that
+  rejection (see `docs/strata-cascade-implementation-guide.md` section 0), but upstream still has no three-tier
+  `--tiered-experts` source and no SSD cold tier, so its `--resident-experts` mode is not a replacement. The port
+  is the point of this fork.
 - The port touches 8 engine surfaces: `src/core/tiered_source.cpp`, `expert_source.hpp`, `remote_experts.hpp`,
   `generate.cpp`, `prefill.cpp`, `expert_cache.cpp`, `serve/server.py`, `CMakeLists.txt` (+ `native_mmap_test.cpp`).
   What each does and where: [`docs/strata-cascade-implementation-guide.md`](docs/strata-cascade-implementation-guide.md).

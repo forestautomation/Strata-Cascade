@@ -5,8 +5,9 @@ expert-source files often, so the port has to be re-landed regularly. This file 
 the changes are and where they go*; `STRATA-CASCADE.md` is the *results* document and `docs/TUNING.md` is the
 *how to tune it* document.
 
-**Target of the current port.** Upstream `origin/main` (`296b59d2`, v0.1.44.1) -> branch `cascade-044` in `<repo>` - the
-port re-landed as one merge commit on the new upstream (0.1.41 -> 0.1.43 -> 0.1.44.1; the same shape each time).
+**Target of the current port.** Upstream `origin/main` (`477ac13c`, v0.1.45) -> branch `cascade-045` in `<repo>` - the
+port re-landed as one merge commit on the new upstream (0.1.41 -> 0.1.43 -> 0.1.44.1 -> 0.1.45; the same shape each
+time; 0.1.45 auto-merged every surface but `src/program/generate.cpp` and `.gitignore`).
 
 This fork's own additions are the Windows implementation; the `also_vram` mask that lets the pinned RAM tier run
 *together with* the CUDA1..3 helper cache (upstream refuses the pair, and it is what makes the cascade faster); and
@@ -29,7 +30,7 @@ the tier into `FileExpertSource`), with parts rewritten so it works on Windows.
 
 ## 0. Why this port exists (the one fact that decides everything)
 
-Upstream aborts when a RAM tier meets a remote expert cache (`src/program/generate.cpp`):
+Until 0.1.44.1 upstream aborted when a RAM tier met a remote expert cache (`src/program/generate.cpp`):
 
 ```cpp
 if (o.resident_cpu_experts && remote_caches) {
@@ -38,9 +39,19 @@ if (o.resident_cpu_experts && remote_caches) {
 }
 ```
 
-Since 0.1.44 a layer split may *also* keep the resident RAM mode, but a CUDA1..3 helper still cannot: with a RAM tier
-and a helper, upstream's only legal choices are the two apart. Cascade is that combination: **VRAM + CUDA1..3 helper +
-pinned RAM budget + cold SSD reads, at once.** If upstream ever lets the two together, this port can be dropped.
+**0.1.45 removes that rejection** (the comment in its place reasons that a stage's helpers are left out of the RAM
+copy and the two adaptive tiers already keep each other's experts out; measured RX 6800 + RX 6600). So the pair
+upstream once refused - a RAM tier beside a CUDA1..3 helper - is now legal upstream, and the merge takes that
+behavioural change: the cascade does **not** re-add the rejection.
+
+What upstream still has not built is the *cascade*: `--tiered-experts` is a distinct source with its own three tiers
+(**VRAM + CUDA1..3 helper + pinned RAM budget + cold SSD reads, at once**), the `also_vram` mask that lets the pinned
+RAM tier run together with a helper without duplicating the helper's experts, Phase C
+(`promote_to_vram` / `retained_pins`), and the SSD cold tier upstream's resident mode has no equivalent for. The port
+therefore stays; but its old one-line justification ("upstream refuses the pair") no longer holds, so the fork's value
+now rests on the tiered sort and the cold tier, not on lifting a rejection. **If upstream's resident mode ever matches
+the cascade's measured numbers on a RAM-starved two-card PC, this port can be dropped** - see `STRATA-CASCADE.md` for
+the comparison numbers.
 
 ---
 

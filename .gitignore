@@ -82,3 +82,6 @@ build-vision-cuda12.bat
 /tools/cascade_bench/guard/*.harness.log
 /tools/cascade_bench/guard/*.engine.log
 /tools/cascade_bench/guard/*.pid
+
+# local Windows HIP packaging output
+dist-hip/

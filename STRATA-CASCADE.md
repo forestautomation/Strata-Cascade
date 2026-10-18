@@ -1,21 +1,23 @@
 # Strata-Cascade: what it is, what it measured
 
-**Build this documents:** upstream Strata **v0.1.44.1** (`origin/main` `296b59d2`) plus the cascade port - branch
-`cascade-044`, re-landed as one merge commit. The **headline numbers** were measured on a fresh build of the port on the
+**Build this documents:** upstream Strata **v0.1.45** (`origin/main` `477ac13c`) plus the cascade port - branch
+`cascade-045`, re-landed as one merge commit. The **headline numbers** were measured on a fresh build of the port on the
 **v0.1.39** base, against a fresh build of that same base with no port (a throwaway stock worktree), one run each at
 128K - the same base on both sides, so the comparisons isolate the fork. The port was later merged to **v0.1.41** and
-**v0.1.43**, re-confirmed on each (see those notes under Cascade vs stock), then to **v0.1.44.1** (re-landed; its
-cascade layout was not re-measured). Everything not described here is upstream's.
+**v0.1.43**, re-confirmed on each (see those notes under Cascade vs stock), then to **v0.1.44.1** and **v0.1.45**
+(re-landed; its cascade layout was not re-measured after 0.1.39). Everything not described here is upstream's.
 
 Cascade is **upstream Strata** plus multiple additions, built around a **cascading expert source**
 (`--tiered-experts`) that lets a PC whose RAM cannot hold every expert run the model anyway, by sorting the experts
-across three tiers and combining them with the CUDA1..3 expert helper - a combination upstream refuses. This file is
-the **reference**: what it does, what it measured, and how it was measured. To **re-apply the port** onto a new
-upstream, see `docs/strata-cascade-implementation-guide.md`; to **tune the layout for your own machine**, see
-`docs/TUNING.md`. The engine plus setup/tuner/docs are the one `cascade` commit.
+across three tiers and combining them with the CUDA1..3 expert helper. This file is the **reference**: what it does,
+what it measured, and how it was measured. To **re-apply the port** onto a new upstream, see
+`docs/strata-cascade-implementation-guide.md`; to **tune the layout for your own machine**, see `docs/TUNING.md`.
+The engine plus setup/tuner/docs are the one `cascade` commit.
 
 Strata-Cascade's own additions are the Windows implementation of the tiered source; running a pinned RAM budget *and*
-a second GPU's expert cache together (upstream forbids that pair, and combining them is what makes the PC fast); and
+a second GPU's expert cache together (0.1.45 lifts upstream's former rejection of a RAM tier beside a helper, but
+upstream still has no three-tier `--tiered-experts` source and no SSD cold tier - and combining the helper cache with
+one is what makes the PC fast); and
 the adaptive rule for which experts move into VRAM while it runs - it no longer duplicates experts the second GPU
 already holds, and it keeps a cheap RAM copy of any it promotes. Setup's automatic selection and the layout tuner are
 this fork's too. **Attribution:** the tiered expert source adapts the algorithm of upstream

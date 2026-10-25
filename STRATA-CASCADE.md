@@ -1,11 +1,12 @@
 # Strata-Cascade: what it is, what it measured
 
-**Build this documents:** upstream Strata **v0.1.45** (`origin/main` `477ac13c`) plus the cascade port - branch
-`cascade-045`, re-landed as one merge commit. The **headline numbers** were measured on a fresh build of the port on the
+**Build this documents:** upstream Strata **v0.2.6** (`origin/main` `4b9e05a2`, engine 0.1.51) plus the cascade port.
+The **headline numbers** were measured on a fresh build of the port on the
 **v0.1.39** base, against a fresh build of that same base with no port (a throwaway stock worktree), one run each at
-128K - the same base on both sides, so the comparisons isolate the fork. The port was later merged to **v0.1.41** and
-**v0.1.43**, re-confirmed on each (see those notes under Cascade vs stock), then to **v0.1.44.1** and **v0.1.45**
-(re-landed; its cascade layout was not re-measured after 0.1.39). Everything not described here is upstream's.
+128K - the same base on both sides, so the comparisons isolate the fork. The port was later merged to **v0.1.41**,
+**v0.1.43**, **v0.1.44.1** and **v0.1.45**, re-confirmed on the first three (see those notes under Cascade vs stock);
+it was not re-measured after 0.1.43, and the 0.2.x bases are not in these numbers. Everything not described here is
+upstream's.
 
 Cascade is **upstream Strata** plus multiple additions, built around a **cascading expert source**
 (`--tiered-experts`) that lets a PC whose RAM cannot hold every expert run the model anyway, by sorting the experts
@@ -55,7 +56,7 @@ contiguous cold blobs are merged into ~8 MiB unbuffered reads, so on the 32K/5K 
 (71.6 GB) at ~3.0 GB/s to 12,998 (77.3 GB) at ~6.6 GB/s and **prefill 760.6 -> 906.9 t/s** (IQ3_XXS,
 `--host-budget-gib 6`, CUDA1 helper; the prompt is DMA-bound after the change).
 
-**On upstream 0.1.43** (the current base) the port re-landed with no cascade change needed: the same IQ3_S config
+**On upstream 0.1.43** (the last base with a cascade measurement) the port re-landed with no cascade change needed: the same IQ3_S config
 re-ran and **did not regress** - decode **45.3 t/s** (was 41.0) and prefill **984.9 t/s** (was 1023, inside the
 +/-5% spread), hit 81.5% (was 78.3%). The decode gain is upstream's new `STRATA_ROUTE_TAIL_SKIP=7` default, on for a
 CUDA serve that misses experts (+10..20%; the answers differ slightly from 0.1.41), and upstream's `PcieAuto` now

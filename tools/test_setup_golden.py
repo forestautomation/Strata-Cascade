@@ -100,10 +100,11 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
         patches = [
             mock.patch.object(setup, "ROOT", t),
             mock.patch.object(setup, "GPU_PICK", None),
-            mock.patch.object(setup, "data_folder", lambda d: (t / "data", [])),
+            mock.patch.object(setup, "data_folder", lambda d, *a, **k: (t / "data", [])),
             mock.patch.object(setup, "load_settings", lambda: {}),
             mock.patch.object(setup, "save_settings", lambda s: None),
             mock.patch.object(setup, "gpus", lambda: found),
+            mock.patch.object(setup, "card_speeds", lambda: {}),
             mock.patch.object(setup, "amd_gpus", lambda: []),
             mock.patch.object(setup, "ram_gb", lambda: ram),
             mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, avx512)),
@@ -111,6 +112,7 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
             mock.patch.object(setup, "page_file_gb", lambda: 16.0),
             mock.patch.object(setup, "is_wsl", lambda: False),
             mock.patch.object(setup, "rotational_disk", lambda p: None),   # #605: the test PC's own disk
+            mock.patch.object(setup, "ple_ram_platform_ok", lambda: False),   # 147-verify: the golden configs as on Windows
             mock.patch.object(setup, "free_gb", lambda p: 900.0),
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: t / "llama.cpp"),
@@ -122,7 +124,7 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
             mock.patch.object(setup, "update_installed_engine", lambda *a, **k: None),
             mock.patch.object(setup, "download", fake_download),
             mock.patch.object(setup, "check_shards", lambda shards: None),
-            mock.patch.object(setup, "verify_sha256", lambda *a: None),
+            mock.patch.object(setup, "verify_sha256", lambda *a, **k: None),
             mock.patch.object(setup, "run", lambda *a, **k: None),
             mock.patch.object(setup, "mtp_corrupt", lambda *a, **k: False),
             mock.patch.object(setup, "refresh_draft_vocab", lambda *a, **k: None),
@@ -149,6 +151,8 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
         cfg = None
         if written and code == 0:
             cfg = normalize(json.loads(written[-1].read_text(encoding="utf-8")), t)
+            # "args_written" (strata_control/user_args.py): the arguments as setup wrote them, so a later hand edit can be told; the golden configs keep their own keys
+            assert cfg.pop("args_written", cfg.get("args")) == cfg.get("args"), "args_written is not the written args"
         return code, out.getvalue(), cfg, asked
 
 
@@ -187,7 +191,14 @@ class Golden(unittest.TestCase):
         cascade = self.golden["32GB-2x24GB qwen IQ3_XXS"]["config"]
         self.assertIn("--tiered-experts", cascade["args"])
         self.assertIsNone(cascade.get("layer_split"))                       # a helper, not a pipeline stage
-        self.assertEqual(cascade.get("gpu"), [0, 1])
+        # CUDA0 is the Main card and comes first; a cascade config carries no "gpu_roles" (that list is Main last)
+        from strata_control import gpu_roles as GR
+        ram, found = PROFILES["32GB-2x24GB"]
+        with mock.patch.object(setup, "card_speeds", lambda: {}):     # the golden harness has no card speeds either
+            rec = GR.recommend(setup.roles_cards(found))["roles"]
+        self.assertEqual(sorted(cascade["gpu"]), [0, 1])
+        self.assertEqual(cascade["gpu"][0], next(i for i, r in rec.items() if r == "main"))
+        self.assertNotIn("gpu_roles", cascade)
 
     def test_yes(self):
         for key, ram, found, family, model in self.cases():

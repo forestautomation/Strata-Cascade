@@ -409,11 +409,12 @@ class SplitShortCard(unittest.TestCase):
         eights = [card(i, "NVIDIA GeForce RTX 3070", 8.0, "86") for i in range(2)]
         self.assertEqual(setup.split_short(eights), [])                   # neither card alone reads more
 
-    def test_yes_takes_the_first_card(self):
+    def test_yes_takes_the_recommended_roles(self):
+        """The 10 GB card is above the 8 GB line, so it starts as a Helper (the owner's rule); the first card is Main and goes last."""
         code, out, cfg, _ = install(127.8, self.FOUND, ["--family", "qwen", "--model", "Q2_0", "--no-start"])
         self.assertEqual(code, 0, out)
-        self.assertEqual(cfg["gpu"], 0)
-        self.assertIn("too small to lend a split its prompt buffers", out)
+        self.assertEqual(cfg["gpu"], [1, 0])
+        self.assertEqual(cfg["gpu_roles"], {"0": "main", "1": "helper"})
 
     def test_named_pair_is_kept(self):
         code, out, cfg, _ = install(127.8, self.FOUND, ["--family", "qwen", "--model", "Q2_0", "--no-start",

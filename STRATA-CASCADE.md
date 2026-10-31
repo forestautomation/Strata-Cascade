@@ -1,12 +1,12 @@
 # Strata-Cascade: what it is, what it measured
 
-**Build this documents:** upstream Strata **v0.2.6** (`origin/main` `4b9e05a2`, engine 0.1.51) plus the cascade port.
+**Build this documents:** upstream Strata **v0.2.9** (`origin/main` `c62d5e3a`, engine 0.1.55) plus the cascade port.
 The **headline numbers** were measured on a fresh build of the port on the
 **v0.1.39** base, against a fresh build of that same base with no port (a throwaway stock worktree), one run each at
 128K - the same base on both sides, so the comparisons isolate the fork. The port was later merged to **v0.1.41**,
-**v0.1.43**, **v0.1.44.1** and **v0.1.45**, re-confirmed on the first three (see those notes under Cascade vs stock);
-it was not re-measured after 0.1.43, and the 0.2.x bases are not in these numbers. Everything not described here is
-upstream's.
+**v0.1.43**, **v0.1.44.1**, **v0.1.45**, **v0.2.6**, **v0.2.8** and **v0.2.9**, re-confirmed on the first three (see
+those notes under Cascade vs stock); it was not re-measured after 0.1.43, and the 0.2.x bases are not in these numbers.
+Everything not described here is upstream's.
 
 Cascade is **upstream Strata** plus multiple additions, built around a **cascading expert source**
 (`--tiered-experts`) that lets a PC whose RAM cannot hold every expert run the model anyway, by sorting the experts

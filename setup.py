@@ -11203,6 +11203,17 @@ def main() -> int:
             ok("cascade: the experts are spread across VRAM, a pinned RAM budget and the SSD (Strata-Cascade). "
                "Turn it off with --low-ram resident")
 
+    if tiered and len(multi) > 1 and getattr(a, "_roles", None):
+        # Strata-Cascade: CUDA0 is its primary expert cache (and the card the drafter, the prompt path and the
+        # head run on), so the Main card comes FIRST in the engine's device list - not upstream's layer-split
+        # order (Main last).  The roles themselves are not written to a cascade config: serve/server.py would
+        # re-sort the cards from them at start (write_config pins "gpu_order": "as_given" for the same reason).
+        main = next((i for i, r in a._roles.items() if r == "main"), None)
+        if main is not None and main in multi:
+            by = {c["index"]: c for c in chosen}
+            multi = [main] + [i for i in multi if i != main]
+            chosen = [by[i] for i in multi if i in by]
+
     # ---- 5. the model files
     step(5, f"downloading {fam['title']} {model}")
     if ready:                                          # pinned files of the pack's repository, each SHA-256-checked
@@ -11650,7 +11661,8 @@ def main() -> int:
     if getattr(a, "_roles", None):                     # the roles themselves (strata_control/gpu_roles.py); "gpu" above is their mirror
         final = cfg["gpu"] if isinstance(cfg.get("gpu"), list) else [cfg["gpu"]]      # what the checks above left (a model that cannot share keeps one card)
         main = final[-1]
-        cfg["gpu_roles"] = {str(i): ("main" if i == main else "helper" if i in final else "off") for i in sorted(set(a._roles) | set(final))}
+        if not tiered:                                 # a cascade config keeps the cards in its own order (CUDA0 first)
+            cfg["gpu_roles"] = {str(i): ("main" if i == main else "helper" if i in final else "off") for i in sorted(set(a._roles) | set(final))}
         cfg["gpus_asked"] = True
         cfg.pop("gpu_none", None)
         if isinstance(cfg.get("gpu"), list) and len(final) > 1:

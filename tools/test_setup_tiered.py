@@ -231,7 +231,11 @@ class EndToEnd(unittest.TestCase):
         # the cascade never layer-splits: GPU 1 is a helper cache, so layer_split is null (server.py keeps both
         # visible without adding --layer-split).  Writing "auto" here makes the engine refuse to start.
         self.assertIsNone(cfg.get("layer_split"))
-        self.assertEqual(cfg["gpu"], [0, 1])
+        # CUDA0 is the cascade's primary expert cache, so the Main card comes FIRST (this profile's recommendation
+        # is card 1: the golden's own check asserts the same).  A "gpu_roles" list would re-sort it at start.
+        self.assertEqual(sorted(cfg["gpu"]), [0, 1])
+        self.assertEqual(cfg["gpu"], [1, 0])
+        self.assertNotIn("gpu_roles", cfg)
         # never both the cascade and the resident/mmap flags (the engine refuses the pair)
         self.assertNotIn("--resident-experts", cfg["args"])
         self.assertNotIn("--mmap-experts", cfg["args"])
